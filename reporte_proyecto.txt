@@ -1,0 +1,369 @@
+================================================================================
+          REPORTE TECNICO - SISTEMA DE MONITOREO DE RADIOENLACE LoRa
+================================================================================
+
+1. DESCRIPCION GENERAL DEL PROYECTO
+--------------------------------------------------------------------------------
+Este proyecto implementa un sistema completo de monitoreo de radioenlace LoRa
+en tiempo real. Consiste en dos nodos microcontrolados (transmisor y receptor)
+que se comunican mediante modulacion LoRa en la banda de 915 MHz, un backend
+en Python que procesa los datos, y un dashboard web Angular que visualiza
+todas las metricas del enlace en tiempo real.
+
+El objetivo principal es analizar y monitorear la calidad del enlace de
+radiofrecuencia, midiendo parametros como RSSI, SNR, latencia y perdida de
+paquetes, y presentandolos de forma grafica e intuitiva.
+
+
+2. ARQUITECTURA DEL SISTEMA
+--------------------------------------------------------------------------------
+
+Flujo de datos:
+
+  +------------------+         LoRa 915 MHz         +------------------+
+  |  TRANSMISOR TX   | ---------------------------> |  RECEPTOR RX     |
+  |  Heltec LoRa 32  |                              |  Heltec LoRa 32  |
+  |  V3 + SX1262     |                              |  V3 + SX1262     |
+  +------------------+                              +--------+---------+
+                                                              |
+                                                       USB Serial
+                                                      115200 baud
+                                                              |
+                                                   +----------v----------+
+                                                   |  BACKEND            |
+                                                   |  Python FastAPI     |
+                                                   |  + Serial Reader    |
+                                                   |  + WebSocket Server |
+                                                   |  + REST API         |
+                                                   +----------+----------+
+                                                              |
+                                                       WebSocket
+                                                   ws://localhost:8000/ws
+                                                              |
+                                                   +----------v----------+
+                                                   |  FRONTEND           |
+                                                   |  Angular 21 +       |
+                                                   |  Tailwind CSS +     |
+                                                   |  ApexCharts         |
+                                                   +---------------------+
+
+
+3. HARDWARE UTILIZADO
+--------------------------------------------------------------------------------
+
+Placas microcontroladoras:
+  - 2x Heltec WiFi LoRa 32 V3 (ESP32-S3)
+
+Transceptor de radio:
+  - Semtech SX1262 (integrado en la placa Heltec)
+  - Frecuencia: 915 MHz (banda ISM)
+  - Ancho de banda: 125 kHz
+  - Factor de ensanchamiento (SF): 7
+  - Tasa de codificacion (CR): 4/5
+  - Potencia de transmision: 14 dBm
+
+Pantalla:
+  - SSD1306 128x64 OLED (I2C) integrada en la placa receptora
+
+
+4. FIRMWARE (MICROCONTROLADORES)
+--------------------------------------------------------------------------------
+
+4.1 Nodo Transmisor (firmware/transmitter/transmitter.ino)
+    - Inicializa el transceptor SX1262 en modo LoRa a 915 MHz
+    - Cada 1 segundo envia un paquete JSON via LoRa con la estructura:
+        { "id": <numero_secuencial>, "ts": <millis_desde_boot> }
+    - El ID es secuencial (1, 2, 3, ...)
+    - ts es el timestamp en milisegundos desde el arranque
+
+4.2 Nodo Receptor (firmware/receiver/receiver.ino)
+    - Inicializa el SX1262 en modo LoRa a 915 MHz (mismos parametros)
+    - Inicializa la pantalla OLED SSD1306 via I2C
+    - Entra en modo de escucha continua (polling)
+    - Al recibir un paquete:
+       a. Extrae los valores de RSSI y SNR del transceptor
+       b. Mide el error de frecuencia (frequency error) en Hz
+       c. Calcula la latencia: tiempo_actual - ts_recibido
+       d. Imprime un JSON por puerto serial (115200 baud) con:
+          { "type": "telemetry", "packet_id": N, "rssi": float,
+            "snr": float, "frequency_error": float, "latency_ms": int,
+            "data": "{...payload original...}" }
+    - Cada 5 segundos envia un heartbeat:
+      { "type": "heartbeat", "uptime": int, "packets_received": int,
+        "last_rssi": float, "last_snr": float, "online": true }
+
+
+5. BACKEND (Python + FastAPI)
+--------------------------------------------------------------------------------
+
+Ubicacion: backend/app/
+
+5.1 Componentes principales
+
+    main.py               - Punto de entrada. Inicia FastAPI con lifespan.
+                            Configura el servicio de telemetria, el gestor
+                            de WebSockets y el lector serial.
+
+    config.py             - Constantes de configuracion:
+                            SERIAL_PORT = "COM3", BAUD_RATE = 115200
+                            BUFFER_SIZE = 1000 (historial de paquetes)
+
+    serial_reader/lora_serial.py
+                          - Lee datos del puerto serial USB en un hilo separado.
+                          - Modo real: Abre COM3, lee lineas JSON.
+                          - Modo simulado: Si no hay puerto serial disponible,
+                            genera datos aleatorios realistas automaticamente
+                            (RSSI ~75 dBm +/- 12, SNR ~8.5 dB +/- 3,
+                             latencia 5-45 ms, etc.)
+
+    services/telemetry_service.py
+                          - Almacena el buffer de ultimos 1000 paquetes.
+                          - Detecta paquetes perdidos por saltos en IDs.
+                          - Calcula tasa de perdida de paquetes.
+                          - Mantiene el estado global del sistema.
+
+    utils/parser.py       - Parsea las lineas JSON del serial.
+                          - Calcula metricas derivadas:
+                              * Porcentaje de intensidad de senal
+                                (RSSI mapeado de -120 a -20 dBm -> 0-100%)
+                              * Calidad del enlace (categorica):
+                                EXCELENTE, BUENA, REGULAR, MARGINAL, CRITICA
+                              * Distancia estimada (formula FSPL - Free Space
+                                Path Loss)
+                              * Estado global del enlace
+
+    models/telemetry_model.py
+                          - Modelos Pydantic para validacion:
+                            TelemetryPacket, SystemState, WebSocketMessage
+
+    routes/telemetry_routes.py
+                          - API REST (prefijo /api):
+                            GET /api/telemetry/latest  -> ultimo paquete
+                            GET /api/telemetry/history -> historial (N paquetes)
+                            GET /api/status             -> estado del sistema
+
+    websocket/socket_manager.py
+                          - Gestiona conexiones WebSocket de los clientes.
+                          - Al conectar, envia el estado inicial del sistema.
+                          - Transmite paquetes en tiempo real a todos los
+                            clientes conectados (broadcast).
+                          - Maneja desconexiones limpiamente.
+
+5.2 Dependencias (requirements.txt)
+    - fastapi==0.115.6
+    - uvicorn[standard]==0.34.0
+    - pyserial==3.5
+    - websockets==14.1
+    - pydantic==2.10.4
+
+
+6. FRONTEND - DASHBOARD WEB (Angular 21)
+--------------------------------------------------------------------------------
+
+Ubicacion: frontend/src/app/
+
+6.1 Stack tecnologico
+    - Framework: Angular 21 (componentes standalone, sin NgModules)
+    - Lenguaje: TypeScript 5.9 (modo estricto)
+    - Estilos: Tailwind CSS 3.4 con tema oscuro personalizado
+    - Graficos: ApexCharts 5.12 via ng-apexcharts 2.4
+    - Estado: RxJS 7.8 (BehaviorSubject + Observables)
+    - Build: Angular CLI 21 con ESBuild/Vite
+
+6.2 Componentes y servicios
+
+    websocket.service.ts  - Cliente WebSocket que se conecta a
+                            ws://localhost:8000/ws
+                          - Reconexion automatica cada 3 segundos
+                          - Expone un Observable messages$ con los mensajes
+                            entrantes parseados
+
+    telemetry.service.ts  - Suscribe a messages$ y distribuye por tipo:
+                            "init"       -> actualiza estado del sistema
+                            "telemetry"  -> actualiza ultimo paquete, historial,
+                                            estado del sistema
+                            "heartbeat"  -> actualiza estado online de nodos
+
+    dashboard-page.component.ts
+                          - Componente principal del dashboard.
+                          - Layout responsive en grid.
+                          - Suscribe a los streams de telemetria.
+                          - Calcula datos derivados (tiempo de actividad,
+                            colores de calidad, etiquetas).
+                          - Mantiene buffer de 60 puntos para el grafico RSSI.
+
+6.3 Datos mostrados en el Dashboard
+
+    A. TARJETAS DE METRICAS (4 tarjetas superiores)
+       ----------------------------------------------
+       Cada tarjeta muestra un valor numerico grande con su unidad y un
+       indicador de color segun la calidad del valor:
+
+       1. RSSI (dBm)
+          - Received Signal Strength Indicator
+          - Indica la potencia de la senal recibida
+          - Valores tipicos: -30 dBm (excelente) a -120 dBm (critico)
+
+       2. SNR (dB)
+          - Signal-to-Noise Ratio - Relacion senal/ruido
+          - Mide que tan clara es la senal respecto al ruido de fondo
+          - Valores tipicos: >10 dB excelente, <0 dB critico
+
+       3. Perdida de Paquetes (%)
+          - Porcentaje de paquetes perdidos en la transmision
+          - Calculado como: paquetes_perdidos / paquetes_enviados * 100
+
+       4. Latencia (ms)
+          - Tiempo que tarda un paquete en viajar del TX al RX
+          - Medido en milisegundos
+
+    B. GRAFICO RSSI EN TIEMPO REAL
+       ----------------------------
+       - Grafico de area (ApexCharts) que muestra la evolucion del RSSI
+         en los ultimos 60 paquetes recibidos
+       - Eje X: numero de muestra o tiempo transcurrido
+       - Eje Y: valor RSSI en dBm
+       - Lineas de referencia horizontales para cada umbral de calidad:
+         EXCELENTE, BUENO, REGULAR, MARGINAL, CRITICO
+       - Relleno con gradiente de color
+
+    C. MEDIDOR RADIAL DE INTENSIDAD DE SENAL
+       ---------------------------------------
+       - Gauge circular (ApexCharts radial bar) que muestra el porcentaje
+         de intensidad de senal (0% a 100%)
+       - Mapeo de RSSI: -120 dBm = 0%, -20 dBm = 100%
+       - Escala de colores: rojo -> amarillo -> verde segun el valor
+
+    D. ESTADO DE NODOS (PANEL LATERAL)
+       ---------------------------------
+       - Indicador de estado para cada nodo (TX y RX)
+       - Circulo animado con efecto "ping" (pulso expansivo) cuando
+         el nodo esta online
+       - Color verde = online, rojo/plomo = offline
+       - Contador de paquetes enviados (TX) y recibidos (RX)
+       - Se actualiza con los heartbeats del receptor
+
+    E. TABLA DE HISTORIAL DE PAQUETES
+       --------------------------------
+       - Muestra los ultimos 20 paquetes recibidos
+       - Columnas:
+           * ID del paquete
+           * RSSI (dBm) - con color segun calidad
+           * SNR (dB)
+           * Latencia (ms)
+           * Calidad del enlace - badge de color (verde, cyan, ambar,
+             naranja, rojo)
+       - Scroll vertical para navegar entre paquetes
+       - Se actualiza automaticamente con cada nuevo paquete
+
+    F. INDICADORES DEL HEADER (BARRA SUPERIOR)
+       -----------------------------------------
+       - Estado de la conexion WebSocket (conectado/desconectado)
+       - Indicador de calidad global del enlace:
+           * EXCELENTE (verde)
+           * BUENO (cyan)
+           * REGULAR (ambar)
+           * MARGINAL (naranja)
+           * CAIDO (rojo)
+       - Contador de tiempo de actividad (uptime) del sistema
+
+    G. FOOTER DE CONTADORES
+       ----------------------
+       - Total de paquetes enviados (acumulado)
+       - Total de paquetes recibidos (acumulado)
+       - Total de paquetes perdidos (acumulado)
+
+
+7. METRICAS DERIVADAS Y FORMULAS
+--------------------------------------------------------------------------------
+
+7.1 Porcentaje de intensidad de senal
+    Formula:
+      signal_pct = (rssi - RSSI_MIN) / (RSSI_MAX - RSSI_MIN) * 100
+    Donde:
+      RSSI_MIN = -120 dBm (peor senal detectable)
+      RSSI_MAX = -20 dBm  (mejor senal posible)
+    El resultado se limita al rango [0, 100]
+
+7.2 Calidad del enlace (categorica)
+    Basado en umbrales combinados de RSSI y SNR:
+
+    | Calidad    | RSSI (dBm) | SNR (dB) |
+    |------------|------------|----------|
+    | EXCELENTE  | > -50      | > 10     |
+    | BUENA      | > -70      | > 7      |
+    | REGULAR    | > -85      | > 4      |
+    | MARGINAL   | > -100     | > 0      |
+    | CRITICA    | <= -100    | <= 0     |
+
+7.3 Perdida de paquetes
+    Se detecta por gaps en los IDs secuenciales de los paquetes:
+      paquetes_perdidos = (id_actual - id_anterior - 1) acumulado
+      perdida_pct = paquetes_perdidos / total_enviados * 100
+
+7.4 Distancia estimada (FSPL)
+    Free Space Path Loss - Formula de Friis:
+      FSPL(dB) = 32.44 + 20*log10(f_MHz) + 20*log10(d_km)
+    Despejando para distancia estimada usando la perdida medida.
+
+7.5 Estado global del enlace
+    Combinacion de calidad de enlace, perdida de paquetes y estado
+    de conexion de los nodos para determinar el estado general:
+    EXCELENTE, BUENO, REGULAR, MARGINAL o CAIDO.
+
+
+8. RESUMEN DEL STACK TECNOLOGICO
+--------------------------------------------------------------------------------
+
+  Capa            Tecnologia
+  --------------  --------------------------------------------------
+  Firmware        Arduino (C++), RadioLib (SX1262), U8x8lib (OLED)
+  Backend         Python 3.13, FastAPI 0.115, Uvicorn, PySerial,
+                  Pydantic 2.10
+  Comunicacion    LoRa 915 MHz (entre nodos), USB Serial (RX->PC),
+                  WebSocket (backend->frontend)
+  Frontend        Angular 21, TypeScript 5.9, Tailwind CSS 3.4,
+                  ApexCharts 5.12, RxJS 7.8
+  Protocolos      JSON (serial y WebSocket), REST API (HTTP)
+
+
+9. CARACTERISTICAS DESTACABLES
+--------------------------------------------------------------------------------
+
+  - Sistema completo IoT: sensor -> microcontrolador -> PC -> web
+  - Modo simulado integrado: funciona sin hardware fisico conectado
+  - Tiempo real: datos transmitidos via WebSocket sin polling
+  - Reconexion automatica del WebSocket en el frontend
+  - Dashboard responsivo y dark-themed con animaciones CSS
+  - Deteccion automatica de paquetes perdidos
+  - Metricas derivadas: distancia estimada, calidad de enlace, etc.
+  - API REST complementaria para consultas puntuales
+  - Arquitectura modular y desacoplada
+  - Componentes Angular standalone (patron moderno de Angular 21)
+  - Heartbeat periodico para monitorear estado de nodos
+
+
+10. REQUISITOS PARA EJECUTAR EL PROYECTO
+--------------------------------------------------------------------------------
+
+  Backend:
+    cd backend
+    pip install -r requirements.txt
+    python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  Frontend:
+    cd frontend
+    npm install
+    npm start
+
+  Firmware:
+    - Abrir transmitter/transmitter.ino y receiver/receiver.ino en
+      Arduino IDE
+    - Instalar librerias: RadioLib, U8x8lib (U8g2)
+    - Seleccionar placa: Heltec WiFi LoRa 32 V3
+    - Cargar a cada placa respectiva
+
+
+================================================================================
+                        FIN DEL REPORTE
+================================================================================
