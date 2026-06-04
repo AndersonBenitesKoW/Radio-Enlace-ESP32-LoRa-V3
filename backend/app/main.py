@@ -50,6 +50,16 @@ def on_heartbeat(line: str):
     )
 
 
+def on_chat_message(line: str):
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    asyncio.run_coroutine_threadsafe(
+        socket_manager.broadcast({"type": "chat", "data": data}), _event_loop
+    )
+
+
 def on_serial_status(event_type: str, data: dict):
     print(f"[SERIAL] Status: {event_type} -> {data}")
     if _event_loop:
@@ -73,6 +83,7 @@ async def lifespan(app: FastAPI):
 
     serial_reader.set_data_callback(on_serial_data)
     serial_reader.set_heartbeat_callback(on_heartbeat)
+    serial_reader.set_chat_callback(on_chat_message)
     serial_reader.set_status_callback(on_serial_status)
     serial_reader.start()
     print(f"[SERIAL] Modo: {'SIMULADO' if SIMULATED_MODE else 'REAL'} | Puerto: {SERIAL_PORT}")
@@ -105,7 +116,13 @@ async def websocket_endpoint(websocket: WebSocket):
     await socket_manager.send_state(websocket, state)
     try:
         while True:
-            await websocket.receive_text()
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "send_chat" and msg.get("message"):
+                    serial_reader.send_message(msg["message"])
+            except (json.JSONDecodeError, Exception):
+                pass
     except WebSocketDisconnect:
         await socket_manager.disconnect(websocket)
     except Exception:

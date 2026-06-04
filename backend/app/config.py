@@ -1,3 +1,5 @@
+import os
+
 PYSERIAL_AVAILABLE = False
 try:
     import serial
@@ -5,7 +7,7 @@ try:
 except ImportError:
     pass
 
-SERIAL_PORT = "COM4"
+SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM4")
 BAUD_RATE = 115200
 BUFFER_SIZE = 1000
 

@@ -54,6 +54,12 @@ export class WebSocketService implements OnDestroy {
     return this.messageSubject.asObservable();
   }
 
+  send(data: any): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    }
+  }
+
   ngOnDestroy(): void {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
