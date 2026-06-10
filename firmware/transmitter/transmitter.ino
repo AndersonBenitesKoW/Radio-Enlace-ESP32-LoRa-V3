@@ -1,10 +1,11 @@
 /*
  * ================================================================================
- * NODO TRANSMISOR FINAL (EMISOR - TX) - MODO TOKENIZADO SANO
+ * NODO TRANSCEPTOR TX - TELEMETRIA + CHAT BIDIRECCIONAL
  * ================================================================================
  * Hardware: Heltec WiFi LoRa 32 V3 (ESP32-S3) + SX1262
- * Objetivo: Enviar el ID incrustado junto a la oración fija usando un token '|'
- * para garantizar la sincronización matemática absoluta con el Receptor.
+ * - Envia telemetria cada 1s con formato "ID|radioenlace exitoso"
+ * - Recibe mensajes de chat por LoRa y los imprime a Serial como JSON
+ * - Lee comandos del PC via Serial (formato "SEND:texto") y los transmite
  * ================================================================================
  */
 
@@ -31,6 +32,7 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 unsigned long lastPacketTime = 0;
 uint32_t packetCounter = 0;
+String serialBuffer = "";
 
 void setup() {
   Serial.begin(115200);
@@ -57,28 +59,64 @@ void setup() {
 
   radio.setOutputPower(TX_POWER);
   Serial.println("[INFO] Chip SX1262 en línea y calibrado en 915.0 MHz.");
-  Serial.println("[INFO] Sincronización por token '|' habilitada.\n");
+  Serial.println("[INFO] Sincronización por token '|' habilitada.");
+  Serial.println("[INFO] Modo TRANSCEPTOR - Chat bidireccional activo.\n");
+  radio.startReceive();
+}
+
+void checkSerialCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      serialBuffer.trim();
+      if (serialBuffer.startsWith("SEND:") && serialBuffer.length() > 5) {
+        String msg = serialBuffer.substring(5);
+        String loraPayload = "CHAT|" + msg;
+        radio.transmit(loraPayload);
+        Serial.print("[CHAT TX] Enviado por LoRa: ");
+        Serial.println(msg);
+        radio.startReceive();
+      }
+      serialBuffer = "";
+    } else if (serialBuffer.length() < 256) {
+      serialBuffer += c;
+    }
+  }
 }
 
 void loop() {
+  checkSerialCommand();
+
+  String rxPayload;
+  int rxState = radio.receive(rxPayload);
+  if (rxState == RADIOLIB_ERR_NONE && rxPayload.length() > 0) {
+    if (rxPayload.startsWith("CHAT|")) {
+      String chatMsg = rxPayload.substring(5);
+      int chatRssi = radio.getRSSI();
+      float chatSnr = radio.getSNR();
+      Serial.print("{\"type\":\"chat\",\"message\":\"");
+      Serial.print(chatMsg);
+      Serial.print("\",\"rssi\":");
+      Serial.print(chatRssi);
+      Serial.print(",\"snr\":");
+      Serial.print(chatSnr, 1);
+      Serial.println("}");
+    }
+  }
+
   unsigned long now = millis();
 
   if (now - lastPacketTime >= PACKET_INTERVAL_MS) {
     lastPacketTime = now;
-    packetCounter++; // Incremento secuencial del identificador real
+    packetCounter++;
 
-    // Estructuramos el mensaje inyectando el ID separado por el token '|'
-    // Formato resultante en el aire: "1|radioenlace exitoso", "2|radioenlace exitoso"...
     char payload[60];
     snprintf(payload, sizeof(payload), "%lu|radioenlace exitoso", packetCounter);
 
-    // Destello del LED testigo físico al iniciar transmisión
     digitalWrite(LED_BUILTIN, HIGH);
 
-    // Transmisión inalámbrica real por RF a 915 MHz
     int state = radio.transmit(payload);
     
-    // Reporte detallado para control de logs y depuración en PC
     Serial.println("--------------------------------------------------");
     Serial.print("[TX ACTIVO] Ráfaga electromagnética enviada... ID: ");
     Serial.println(packetCounter);
@@ -93,7 +131,7 @@ void loop() {
     }
     Serial.println("--------------------------------------------------");
 
-    // Apagamos el LED indicando que el paquete terminó de salir
     digitalWrite(LED_BUILTIN, LOW);
+    radio.startReceive();
   }
 }

@@ -1,6 +1,7 @@
 /*
  * ================================================================================
  * NODO RECEPTOR FINAL (RX) - SINCRONIZACIÓN ABSOLUTA SIN ERRORES
+ * + CHAT BIDIRECCIONAL: Recibe/transmite mensajes de texto por LoRa
  * ================================================================================
  */
 
@@ -30,6 +31,7 @@ uint32_t packetsReceived = 0;
 int lastRSSI = 0;
 float lastSNR = 0.0;
 unsigned long lastPacketId = 0;
+String serialBuffer = "";
 
 void sendHeartbeat();
 void updateDisplay();
@@ -62,53 +64,89 @@ void setup() {
   sendHeartbeat(); 
 }
 
+void checkSerialCommand() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      serialBuffer.trim();
+      if (serialBuffer.startsWith("SEND:") && serialBuffer.length() > 5) {
+        String msg = serialBuffer.substring(5);
+        String loraPayload = "CHAT|" + msg;
+        radio.transmit(loraPayload);
+        radio.startReceive();
+      }
+      serialBuffer = "";
+    } else if (serialBuffer.length() < 256) {
+      serialBuffer += c;
+    }
+  }
+}
+
 void loop() {
+  checkSerialCommand();
+
   String payload;
   int state = radio.receive(payload);
 
   if (state == RADIOLIB_ERR_NONE && payload.length() > 0) {
     digitalWrite(LED_BUILTIN, HIGH);
-    packetsReceived++;
 
-    lastRSSI = radio.getRSSI(); 
-    lastSNR  = radio.getSNR();  
-    float freqErr = radio.getFrequencyError(); 
+    if (payload.startsWith("CHAT|")) {
+      String chatMsg = payload.substring(5);
+      lastRSSI = radio.getRSSI();
+      lastSNR  = radio.getSNR();
 
-    uint32_t packetId = 0;
-    String cleanData = payload;
-
-    // ALGORITMO DE APERTURA DEL TOKEN '|'
-    int tokenIdx = payload.indexOf('|');
-    if (tokenIdx >= 0) {
-      // Extraemos los números que están antes de la barra vertical
-      String idStr = payload.substring(0, tokenIdx);
-      packetId = idStr.toInt();
-      // Extraemos el texto neto que está después de la barra
-      cleanData = payload.substring(tokenIdx + 1);
+      Serial.print("{\"type\":\"chat\",\"message\":\"");
+      Serial.print(chatMsg);
+      Serial.print("\",\"rssi\":");
+      Serial.print(lastRSSI);
+      Serial.print(",\"snr\":");
+      Serial.print(lastSNR, 1);
+      Serial.println("}");
     } else {
-      // Alivio de protección en caso de que llegue un paquete sin token
-      packetId = packetsReceived;
+      packetsReceived++;
+
+      lastRSSI = radio.getRSSI(); 
+      lastSNR  = radio.getSNR();  
+      float freqErr = radio.getFrequencyError(); 
+
+      uint32_t packetId = 0;
+      String cleanData = payload;
+
+      // ALGORITMO DE APERTURA DEL TOKEN '|'
+      int tokenIdx = payload.indexOf('|');
+      if (tokenIdx >= 0) {
+        // Extraemos los números que están antes de la barra vertical
+        String idStr = payload.substring(0, tokenIdx);
+        packetId = idStr.toInt();
+        // Extraemos el texto neto que está después de la barra
+        cleanData = payload.substring(tokenIdx + 1);
+      } else {
+        // Alivio de protección en caso de que llegue un paquete sin token
+        packetId = packetsReceived;
+      }
+
+      lastPacketId = packetId;
+
+      // SALIDA SERIAL COMPATIBLE CON TU PYTHON Y DASHBOARD EN ANGULAR
+      Serial.print("{\"type\":\"telemetry\"");
+      Serial.print(",\"rssi\":");
+      Serial.print(lastRSSI);
+      Serial.print(",\"snr\":");
+      Serial.print(lastSNR, 1);
+      Serial.print(",\"latency_ms\":");
+      Serial.print(random(4, 9)); // Latencia calibrada de laboratorio de mesa
+      Serial.print(",\"packet_id\":");
+      Serial.print(lastPacketId); // ¡Sincronizado al 100% con el ID del Emisor!
+      Serial.print(",\"frequency_error\":");
+      Serial.print(freqErr, 1);
+      Serial.print(",\"data\":\"");
+      Serial.print(cleanData);
+      Serial.println("\"}");
+
+      updateDisplay();
     }
 
-    lastPacketId = packetId;
-
-    // SALIDA SERIAL COMPATIBLE CON TU PYTHON Y DASHBOARD EN ANGULAR
-    Serial.print("{\"type\":\"telemetry\"");
-    Serial.print(",\"rssi\":");
-    Serial.print(lastRSSI);
-    Serial.print(",\"snr\":");
-    Serial.print(lastSNR, 1);
-    Serial.print(",\"latency_ms\":");
-    Serial.print(random(4, 9)); // Latencia calibrada de laboratorio de mesa
-    Serial.print(",\"packet_id\":");
-    Serial.print(lastPacketId); // ¡Sincronizado al 100% con el ID del Emisor!
-    Serial.print(",\"frequency_error\":");
-    Serial.print(freqErr, 1);
-    Serial.print(",\"data\":\"");
-    Serial.print(cleanData);
-    Serial.println("\"}");
-
-    updateDisplay();
     delay(20);
     digitalWrite(LED_BUILTIN, LOW);
   }

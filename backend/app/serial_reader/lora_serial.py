@@ -21,8 +21,10 @@ class LoRaSerialReader:
         self._on_data_callback = None
         self._on_heartbeat_callback = None
         self._on_status_callback = None
+        self._on_chat_callback = None
         self._sim_packet_id = 0
         self._connected = False
+        self._serial = None
 
     def set_data_callback(self, callback):
         self._on_data_callback = callback
@@ -32,6 +34,17 @@ class LoRaSerialReader:
 
     def set_status_callback(self, callback):
         self._on_status_callback = callback
+
+    def set_chat_callback(self, callback):
+        self._on_chat_callback = callback
+
+    def send_message(self, text: str):
+        if self._serial and self._serial.is_open:
+            try:
+                line = f"SEND:{text}\n"
+                self._serial.write(line.encode("utf-8"))
+            except Exception as e:
+                print(f"[SERIAL] Error enviando mensaje: {e}")
 
     @property
     def connected(self) -> bool:
@@ -84,6 +97,7 @@ class LoRaSerialReader:
             return False
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=1)
+            self._serial = ser
             self._connected = True
             if self._on_status_callback:
                 self._on_status_callback("serial_connected", {"port": self.port, "simulated": False})
@@ -98,6 +112,7 @@ class LoRaSerialReader:
                 except UnicodeDecodeError:
                     continue
             ser.close()
+            self._serial = None
             self._connected = False
             if self._on_status_callback:
                 self._on_status_callback("serial_disconnected", {"port": self.port})
@@ -153,3 +168,5 @@ class LoRaSerialReader:
             self._on_data_callback(line)
         elif data.get("type") == "heartbeat" and self._on_heartbeat_callback:
             self._on_heartbeat_callback(line)
+        elif data.get("type") == "chat" and self._on_chat_callback:
+            self._on_chat_callback(line)
