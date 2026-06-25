@@ -86,7 +86,7 @@ async def lifespan(app: FastAPI):
     serial_reader.set_chat_callback(on_chat_message)
     serial_reader.set_status_callback(on_serial_status)
     serial_reader.start()
-    print(f"[SERIAL] Modo: {'SIMULADO' if SIMULATED_MODE else 'REAL'} | Puerto: {SERIAL_PORT}")
+    print(f"[SERIAL] Modo: {'SIMULADO' if SIMULATED_MODE else 'REAL'} | Puerto: {SERIAL_PORT or 'ninguno (simulado)'}")
     yield
     serial_reader.stop()
     print("[SERIAL] Detenido")

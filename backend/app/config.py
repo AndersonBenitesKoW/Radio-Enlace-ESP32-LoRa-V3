@@ -7,8 +7,8 @@ try:
 except ImportError:
     pass
 
-SERIAL_PORT = os.environ.get("SERIAL_PORT", "COM4")
+SERIAL_PORT = os.environ.get("SERIAL_PORT")
 BAUD_RATE = 115200
 BUFFER_SIZE = 1000
 
-SIMULATED_MODE = not PYSERIAL_AVAILABLE
+SIMULATED_MODE = SERIAL_PORT is None

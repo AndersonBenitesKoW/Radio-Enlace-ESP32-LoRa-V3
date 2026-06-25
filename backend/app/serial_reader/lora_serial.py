@@ -12,10 +12,10 @@ except ImportError:
 
 
 class LoRaSerialReader:
-    def __init__(self, port: str = "COM3", baudrate: int = 115200, simulated: bool = False):
+    def __init__(self, port: str = None, baudrate: int = 115200, simulated: bool = False):
         self.port = port
         self.baudrate = baudrate
-        self.simulated = simulated
+        self.simulated = simulated or (port is None)
         self._running = False
         self._thread = None
         self._on_data_callback = None

@@ -9,6 +9,16 @@
  * ================================================================================
  */
 
+// void setup() {
+//   Serial.begin(115200);
+//   delay(1000);
+//   Serial.println("PRUEBA");
+// }
+
+// void loop() {
+//   Serial.println(".");
+//   delay(1000);
+// }
 #include <RadioLib.h>
 
 // Pines físicos del chip SX1262 en Heltec V3
