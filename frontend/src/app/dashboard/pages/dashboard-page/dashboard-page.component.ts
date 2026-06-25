@@ -586,6 +586,7 @@ export class DashboardPageComponent implements OnInit, OnDestroy {
 
     this.telemetry.systemState$.pipe(takeUntil(this.destroy$)).subscribe((s) => {
       this.systemState = s;
+      if (s) this.wsStatus = 'LIVE';
     });
 
     this.telemetry.history$.pipe(takeUntil(this.destroy$)).subscribe((h) => {
@@ -605,11 +606,6 @@ export class DashboardPageComponent implements OnInit, OnDestroy {
       }
     });
 
-    setTimeout(() => {
-      if (!this.latestPacket) {
-        this.wsStatus = 'Esperando backend...';
-      }
-    }, 5000);
   }
 
   ngOnDestroy(): void {

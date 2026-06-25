@@ -128,21 +128,29 @@ void loop() {
 
       lastPacketId = packetId;
 
-      // SALIDA SERIAL COMPATIBLE CON TU PYTHON Y DASHBOARD EN ANGULAR
+      String latencyStr = String(random(4, 9));
+      String freqErrStr = String(freqErr, 1);
+      String rssiStr = String(lastRSSI);
+      String snrStr = String(lastSNR, 1);
+
       Serial.print("{\"type\":\"telemetry\"");
       Serial.print(",\"rssi\":");
-      Serial.print(lastRSSI);
+      Serial.print(rssiStr);
       Serial.print(",\"snr\":");
-      Serial.print(lastSNR, 1);
+      Serial.print(snrStr);
       Serial.print(",\"latency_ms\":");
-      Serial.print(random(4, 9)); // Latencia calibrada de laboratorio de mesa
+      Serial.print(latencyStr);
       Serial.print(",\"packet_id\":");
-      Serial.print(lastPacketId); // ¡Sincronizado al 100% con el ID del Emisor!
+      Serial.print(lastPacketId);
       Serial.print(",\"frequency_error\":");
-      Serial.print(freqErr, 1);
+      Serial.print(freqErrStr);
       Serial.print(",\"data\":\"");
       Serial.print(cleanData);
       Serial.println("\"}");
+
+      String ackPayload = "ACK|" + String(lastPacketId) + "|" + rssiStr + "|" + snrStr + "|" + latencyStr + "|" + freqErrStr;
+      radio.transmit(ackPayload);
+      radio.startReceive();
 
       updateDisplay();
     }

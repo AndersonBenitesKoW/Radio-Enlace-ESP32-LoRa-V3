@@ -125,7 +125,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 pass
     except WebSocketDisconnect:
         await socket_manager.disconnect(websocket)
-    except Exception:
+    except Exception as e:
+        print(f"[WS ERROR] WebSocket exception: {e}")
         await socket_manager.disconnect(websocket)
 
 

@@ -41,6 +41,7 @@
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 unsigned long lastPacketTime = 0;
+unsigned long lastHeartbeat = 0;
 uint32_t packetCounter = 0;
 String serialBuffer = "";
 
@@ -86,6 +87,7 @@ void checkSerialCommand() {
         Serial.print("[CHAT TX] Enviado por LoRa: ");
         Serial.println(msg);
         radio.startReceive();
+        lastPacketTime = millis();
       }
       serialBuffer = "";
     } else if (serialBuffer.length() < 256) {
@@ -111,6 +113,33 @@ void loop() {
       Serial.print(",\"snr\":");
       Serial.print(chatSnr, 1);
       Serial.println("}");
+
+    } else if (rxPayload.startsWith("ACK|")) {
+      int p1 = rxPayload.indexOf('|', 4);
+      int p2 = rxPayload.indexOf('|', p1 + 1);
+      int p3 = rxPayload.indexOf('|', p2 + 1);
+      int p4 = rxPayload.indexOf('|', p3 + 1);
+      if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
+        uint32_t ackId = rxPayload.substring(4, p1).toInt();
+        int ackRssi = rxPayload.substring(p1 + 1, p2).toInt();
+        float ackSnr = rxPayload.substring(p2 + 1, p3).toFloat();
+        int ackLatency = rxPayload.substring(p3 + 1, p4).toInt();
+        float ackFreqErr = rxPayload.substring(p4 + 1).toFloat();
+
+        Serial.print("{\"type\":\"telemetry\"");
+        Serial.print(",\"rssi\":");
+        Serial.print(ackRssi);
+        Serial.print(",\"snr\":");
+        Serial.print(ackSnr, 1);
+        Serial.print(",\"latency_ms\":");
+        Serial.print(ackLatency);
+        Serial.print(",\"packet_id\":");
+        Serial.print(ackId);
+        Serial.print(",\"frequency_error\":");
+        Serial.print(ackFreqErr, 1);
+        Serial.print(",\"data\":\"radioenlace exitoso\"");
+        Serial.println("}");
+      }
     }
   }
 
@@ -143,5 +172,17 @@ void loop() {
 
     digitalWrite(LED_BUILTIN, LOW);
     radio.startReceive();
+  }
+
+  now = millis();
+  if (now - lastHeartbeat >= 5000) {
+    lastHeartbeat = now;
+    Serial.print("{\"type\":\"heartbeat\"");
+    Serial.print(",\"status\":\"online\"");
+    Serial.print(",\"uptime\":");
+    Serial.print(millis() / 1000);
+    Serial.print(",\"packets_tx\":");
+    Serial.print(packetCounter);
+    Serial.println("}");
   }
 }

@@ -6,6 +6,7 @@ export class WebSocketService implements OnDestroy {
   private ws: WebSocket | null = null;
   private messageSubject = new Subject<any>();
   private reconnectTimer: any;
+  private pendingMessages: any[] = [];
   private url = 'ws://localhost:8000/ws';
 
   constructor() {
@@ -18,6 +19,10 @@ export class WebSocketService implements OnDestroy {
 
       this.ws.onopen = () => {
         console.log('[WS] Conectado al backend');
+        while (this.pendingMessages.length > 0) {
+          const msg = this.pendingMessages.shift();
+          this.ws?.send(JSON.stringify(msg));
+        }
       };
 
       this.ws.onmessage = (event) => {
@@ -57,6 +62,8 @@ export class WebSocketService implements OnDestroy {
   send(data: any): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
+    } else {
+      this.pendingMessages.push(data);
     }
   }
 
