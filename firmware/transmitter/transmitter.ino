@@ -4,21 +4,13 @@
  * ================================================================================
  * Hardware: Heltec WiFi LoRa 32 V3 (ESP32-S3) + SX1262
  * - Envia telemetria cada 1s con formato "ID|radioenlace exitoso"
+ * - Recibe ACKs del RX con RSSI/SNR/latencia y los reenvia como JSON a su PC
  * - Recibe mensajes de chat por LoRa y los imprime a Serial como JSON
  * - Lee comandos del PC via Serial (formato "SEND:texto") y los transmite
+ * - Recepcion NO bloqueante por interrupcion DIO1
  * ================================================================================
  */
 
-// void setup() {
-//   Serial.begin(115200);
-//   delay(1000);
-//   Serial.println("PRUEBA");
-// }
-
-// void loop() {
-//   Serial.println(".");
-//   delay(1000);
-// }
 #include <RadioLib.h>
 
 // Pines físicos del chip SX1262 en Heltec V3
@@ -32,10 +24,10 @@
 
 // Configuración de Radiofrecuencia (Alineado con tus pruebas)
 #define FREQUENCY      915.0   // Banda de frecuencia de tu proyecto
-#define BANDWIDTH      125.0   
-#define SPREADING_FACTOR 7     
-#define CODING_RATE     5      
-#define TX_POWER        14     
+#define BANDWIDTH      125.0
+#define SPREADING_FACTOR 7
+#define CODING_RATE     5
+#define TX_POWER        14
 #define PACKET_INTERVAL_MS 1000 // Envía exactamente cada 1 segundo
 
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
@@ -44,6 +36,12 @@ unsigned long lastPacketTime = 0;
 unsigned long lastHeartbeat = 0;
 uint32_t packetCounter = 0;
 String serialBuffer = "";
+
+volatile bool receivedFlag = false;
+
+void IRAM_ATTR onLoRaReceive() {
+  receivedFlag = true;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -69,10 +67,14 @@ void setup() {
   }
 
   radio.setOutputPower(TX_POWER);
+
+  // Configurar interrupción DIO1 para recepción NO bloqueante
+  radio.setDio1Action(onLoRaReceive);
+  radio.startReceive();
+
   Serial.println("[INFO] Chip SX1262 en línea y calibrado en 915.0 MHz.");
   Serial.println("[INFO] Sincronización por token '|' habilitada.");
-  Serial.println("[INFO] Modo TRANSCEPTOR - Chat bidireccional activo.\n");
-  radio.startReceive();
+  Serial.println("[INFO] Modo RECEPCION POR INTERRUPCION - Chat bidireccional activo.\n");
 }
 
 void checkSerialCommand() {
@@ -86,6 +88,7 @@ void checkSerialCommand() {
         radio.transmit(loraPayload);
         Serial.print("[CHAT TX] Enviado por LoRa: ");
         Serial.println(msg);
+        receivedFlag = false;
         radio.startReceive();
         lastPacketTime = millis();
       }
@@ -99,48 +102,54 @@ void checkSerialCommand() {
 void loop() {
   checkSerialCommand();
 
-  String rxPayload;
-  int rxState = radio.receive(rxPayload);
-  if (rxState == RADIOLIB_ERR_NONE && rxPayload.length() > 0) {
-    if (rxPayload.startsWith("CHAT|")) {
-      String chatMsg = rxPayload.substring(5);
-      int chatRssi = radio.getRSSI();
-      float chatSnr = radio.getSNR();
-      Serial.print("{\"type\":\"chat\",\"message\":\"");
-      Serial.print(chatMsg);
-      Serial.print("\",\"rssi\":");
-      Serial.print(chatRssi);
-      Serial.print(",\"snr\":");
-      Serial.print(chatSnr, 1);
-      Serial.println("}");
+  if (receivedFlag) {
+    receivedFlag = false;
 
-    } else if (rxPayload.startsWith("ACK|")) {
-      int p1 = rxPayload.indexOf('|', 4);
-      int p2 = rxPayload.indexOf('|', p1 + 1);
-      int p3 = rxPayload.indexOf('|', p2 + 1);
-      int p4 = rxPayload.indexOf('|', p3 + 1);
-      if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
-        uint32_t ackId = rxPayload.substring(4, p1).toInt();
-        int ackRssi = rxPayload.substring(p1 + 1, p2).toInt();
-        float ackSnr = rxPayload.substring(p2 + 1, p3).toFloat();
-        int ackLatency = rxPayload.substring(p3 + 1, p4).toInt();
-        float ackFreqErr = rxPayload.substring(p4 + 1).toFloat();
-
-        Serial.print("{\"type\":\"telemetry\"");
-        Serial.print(",\"rssi\":");
-        Serial.print(ackRssi);
+    String rxPayload;
+    int rxState = radio.readData(rxPayload);
+    if (rxState == RADIOLIB_ERR_NONE && rxPayload.length() > 0) {
+      if (rxPayload.startsWith("CHAT|")) {
+        String chatMsg = rxPayload.substring(5);
+        int chatRssi = radio.getRSSI();
+        float chatSnr = radio.getSNR();
+        Serial.print("{\"type\":\"chat\",\"message\":\"");
+        Serial.print(chatMsg);
+        Serial.print("\",\"rssi\":");
+        Serial.print(chatRssi);
         Serial.print(",\"snr\":");
-        Serial.print(ackSnr, 1);
-        Serial.print(",\"latency_ms\":");
-        Serial.print(ackLatency);
-        Serial.print(",\"packet_id\":");
-        Serial.print(ackId);
-        Serial.print(",\"frequency_error\":");
-        Serial.print(ackFreqErr, 1);
-        Serial.print(",\"data\":\"radioenlace exitoso\"");
+        Serial.print(chatSnr, 1);
         Serial.println("}");
+
+      } else if (rxPayload.startsWith("ACK|")) {
+        int p1 = rxPayload.indexOf('|', 4);
+        int p2 = rxPayload.indexOf('|', p1 + 1);
+        int p3 = rxPayload.indexOf('|', p2 + 1);
+        int p4 = rxPayload.indexOf('|', p3 + 1);
+        if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
+          uint32_t ackId = rxPayload.substring(4, p1).toInt();
+          int ackRssi = rxPayload.substring(p1 + 1, p2).toInt();
+          float ackSnr = rxPayload.substring(p2 + 1, p3).toFloat();
+          int ackLatency = rxPayload.substring(p3 + 1, p4).toInt();
+          float ackFreqErr = rxPayload.substring(p4 + 1).toFloat();
+
+          Serial.print("{\"type\":\"telemetry\"");
+          Serial.print(",\"rssi\":");
+          Serial.print(ackRssi);
+          Serial.print(",\"snr\":");
+          Serial.print(ackSnr, 1);
+          Serial.print(",\"latency_ms\":");
+          Serial.print(ackLatency);
+          Serial.print(",\"packet_id\":");
+          Serial.print(ackId);
+          Serial.print(",\"frequency_error\":");
+          Serial.print(ackFreqErr, 1);
+          Serial.print(",\"data\":\"radioenlace exitoso\"");
+          Serial.println("}");
+        }
       }
     }
+
+    radio.startReceive();
   }
 
   unsigned long now = millis();
@@ -155,13 +164,13 @@ void loop() {
     digitalWrite(LED_BUILTIN, HIGH);
 
     int state = radio.transmit(payload);
-    
+
     Serial.println("--------------------------------------------------");
     Serial.print("[TX ACTIVO] Ráfaga electromagnética enviada... ID: ");
     Serial.println(packetCounter);
-    Serial.print("[PAYLOAD EMITIDO]: "); 
+    Serial.print("[PAYLOAD EMITIDO]: ");
     Serial.println(payload);
-    
+
     if (state == RADIOLIB_ERR_NONE) {
       Serial.println("[ESTADO] -> ¡Enviado físicamente con éxito!");
     } else {
@@ -171,6 +180,7 @@ void loop() {
     Serial.println("--------------------------------------------------");
 
     digitalWrite(LED_BUILTIN, LOW);
+    receivedFlag = false;
     radio.startReceive();
   }
 

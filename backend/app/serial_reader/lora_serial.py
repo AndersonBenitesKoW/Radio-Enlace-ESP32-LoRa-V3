@@ -45,6 +45,22 @@ class LoRaSerialReader:
                 self._serial.write(line.encode("utf-8"))
             except Exception as e:
                 print(f"[SERIAL] Error enviando mensaje: {e}")
+                if self._on_status_callback:
+                    self._on_status_callback("chat_error", {"error": str(e), "message": text})
+        elif self.simulated:
+            import random
+            simulated = json.dumps({
+                "type": "chat",
+                "message": text,
+                "rssi": round(random.gauss(-45, 8), 1),
+                "snr": round(random.gauss(10, 2), 1),
+            })
+            print(f"[SIMULATED CHAT] Echo: {text}")
+            if self._on_chat_callback:
+                self._on_chat_callback(simulated)
+        else:
+            if self._on_status_callback:
+                self._on_status_callback("chat_error", {"error": "Serial no conectado", "message": text})
 
     @property
     def connected(self) -> bool:

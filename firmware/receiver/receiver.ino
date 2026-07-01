@@ -2,6 +2,7 @@
  * ================================================================================
  * NODO RECEPTOR FINAL (RX) - SINCRONIZACIÓN ABSOLUTA SIN ERRORES
  * + CHAT BIDIRECCIONAL: Recibe/transmite mensajes de texto por LoRa
+ * + Recepcion NO bloqueante por interrupcion DIO1
  * ================================================================================
  */
 
@@ -33,22 +34,28 @@ float lastSNR = 0.0;
 unsigned long lastPacketId = 0;
 String serialBuffer = "";
 
+volatile bool receivedFlag = false;
+
+void IRAM_ATTR onLoRaReceive() {
+  receivedFlag = true;
+}
+
 void sendHeartbeat();
 void updateDisplay();
 
 void setup() {
-  Serial.begin(115200); 
+  Serial.begin(115200);
   delay(1000);
 
-  nvs_flash_erase();      
-  nvs_flash_init();       
+  nvs_flash_erase();
+  nvs_flash_init();
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
-  
+
   u8g2.firstPage();
   do {
     u8g2.drawStr(0, 15, "RX: MODO SINCRONO");
@@ -57,11 +64,13 @@ void setup() {
 
   int state = radio.begin(FREQUENCY, BANDWIDTH, SPREADING_FACTOR, CODING_RATE);
   if (state != RADIOLIB_ERR_NONE) {
-    while (true); 
+    while (true);
   }
 
+  radio.setOutputPower(14);
+  radio.setDio1Action(onLoRaReceive);
   radio.startReceive();
-  sendHeartbeat(); 
+  sendHeartbeat();
 }
 
 void checkSerialCommand() {
@@ -73,6 +82,7 @@ void checkSerialCommand() {
         String msg = serialBuffer.substring(5);
         String loraPayload = "CHAT|" + msg;
         radio.transmit(loraPayload);
+        receivedFlag = false;
         radio.startReceive();
       }
       serialBuffer = "";
@@ -85,78 +95,79 @@ void checkSerialCommand() {
 void loop() {
   checkSerialCommand();
 
-  String payload;
-  int state = radio.receive(payload);
+  if (receivedFlag) {
+    receivedFlag = false;
 
-  if (state == RADIOLIB_ERR_NONE && payload.length() > 0) {
-    digitalWrite(LED_BUILTIN, HIGH);
+    String payload;
+    int state = radio.readData(payload);
 
-    if (payload.startsWith("CHAT|")) {
-      String chatMsg = payload.substring(5);
-      lastRSSI = radio.getRSSI();
-      lastSNR  = radio.getSNR();
+    if (state == RADIOLIB_ERR_NONE && payload.length() > 0) {
+      digitalWrite(LED_BUILTIN, HIGH);
 
-      Serial.print("{\"type\":\"chat\",\"message\":\"");
-      Serial.print(chatMsg);
-      Serial.print("\",\"rssi\":");
-      Serial.print(lastRSSI);
-      Serial.print(",\"snr\":");
-      Serial.print(lastSNR, 1);
-      Serial.println("}");
-    } else {
-      packetsReceived++;
+      if (payload.startsWith("CHAT|")) {
+        String chatMsg = payload.substring(5);
+        lastRSSI = radio.getRSSI();
+        lastSNR  = radio.getSNR();
 
-      lastRSSI = radio.getRSSI(); 
-      lastSNR  = radio.getSNR();  
-      float freqErr = radio.getFrequencyError(); 
+        Serial.print("{\"type\":\"chat\",\"message\":\"");
+        Serial.print(chatMsg);
+        Serial.print("\",\"rssi\":");
+        Serial.print(lastRSSI);
+        Serial.print(",\"snr\":");
+        Serial.print(lastSNR, 1);
+        Serial.println("}");
+      } else if (payload.length() > 0 && isDigit(payload.charAt(0))) {
+        packetsReceived++;
 
-      uint32_t packetId = 0;
-      String cleanData = payload;
+        lastRSSI = radio.getRSSI();
+        lastSNR  = radio.getSNR();
+        float freqErr = radio.getFrequencyError();
 
-      // ALGORITMO DE APERTURA DEL TOKEN '|'
-      int tokenIdx = payload.indexOf('|');
-      if (tokenIdx >= 0) {
-        // Extraemos los números que están antes de la barra vertical
-        String idStr = payload.substring(0, tokenIdx);
-        packetId = idStr.toInt();
-        // Extraemos el texto neto que está después de la barra
-        cleanData = payload.substring(tokenIdx + 1);
-      } else {
-        // Alivio de protección en caso de que llegue un paquete sin token
-        packetId = packetsReceived;
+        uint32_t packetId = 0;
+        String cleanData = payload;
+
+        // ALGORITMO DE APERTURA DEL TOKEN '|'
+        int tokenIdx = payload.indexOf('|');
+        if (tokenIdx >= 0) {
+          String idStr = payload.substring(0, tokenIdx);
+          packetId = idStr.toInt();
+          cleanData = payload.substring(tokenIdx + 1);
+      } else if (payload.length() > 0 && isDigit(payload.charAt(0))) {
+          packetId = packetsReceived;
+        }
+
+        lastPacketId = packetId;
+
+        String latencyStr = String(random(4, 9));
+        String freqErrStr = String(freqErr, 1);
+        String rssiStr = String(lastRSSI);
+        String snrStr = String(lastSNR, 1);
+
+        Serial.print("{\"type\":\"telemetry\"");
+        Serial.print(",\"rssi\":");
+        Serial.print(rssiStr);
+        Serial.print(",\"snr\":");
+        Serial.print(snrStr);
+        Serial.print(",\"latency_ms\":");
+        Serial.print(latencyStr);
+        Serial.print(",\"packet_id\":");
+        Serial.print(lastPacketId);
+        Serial.print(",\"frequency_error\":");
+        Serial.print(freqErrStr);
+        Serial.print(",\"data\":\"");
+        Serial.print(cleanData);
+        Serial.println("\"}");
+
+        String ackPayload = "ACK|" + String(lastPacketId) + "|" + rssiStr + "|" + snrStr + "|" + latencyStr + "|" + freqErrStr;
+        radio.transmit(ackPayload);
+        updateDisplay();
       }
 
-      lastPacketId = packetId;
-
-      String latencyStr = String(random(4, 9));
-      String freqErrStr = String(freqErr, 1);
-      String rssiStr = String(lastRSSI);
-      String snrStr = String(lastSNR, 1);
-
-      Serial.print("{\"type\":\"telemetry\"");
-      Serial.print(",\"rssi\":");
-      Serial.print(rssiStr);
-      Serial.print(",\"snr\":");
-      Serial.print(snrStr);
-      Serial.print(",\"latency_ms\":");
-      Serial.print(latencyStr);
-      Serial.print(",\"packet_id\":");
-      Serial.print(lastPacketId);
-      Serial.print(",\"frequency_error\":");
-      Serial.print(freqErrStr);
-      Serial.print(",\"data\":\"");
-      Serial.print(cleanData);
-      Serial.println("\"}");
-
-      String ackPayload = "ACK|" + String(lastPacketId) + "|" + rssiStr + "|" + snrStr + "|" + latencyStr + "|" + freqErrStr;
-      radio.transmit(ackPayload);
-      radio.startReceive();
-
-      updateDisplay();
+      delay(20);
+      digitalWrite(LED_BUILTIN, LOW);
     }
 
-    delay(20);
-    digitalWrite(LED_BUILTIN, LOW);
+    radio.startReceive();
   }
 
   unsigned long now = millis();
