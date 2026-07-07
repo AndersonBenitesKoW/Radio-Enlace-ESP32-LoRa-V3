@@ -6,23 +6,29 @@
 --------------------------------------------------------------------------------
 Este proyecto implementa un sistema completo de monitoreo de radioenlace LoRa
 en tiempo real con datos 100% reales (sin simulacion). Consiste en dos nodos
-microcontrolados (transmisor y receptor) que se comunican mediante modulacion
-LoRa en la banda de 915 MHz usando un protocolo tokenizado con el separador '|',
-un backend en Python que procesa los datos via puerto Serial USB, y un dashboard
-web Angular que visualiza todas las metricas del enlace en tiempo real via
-WebSocket.
+microcontrolados (ambos identicos en hardware, diferenciados solo por un flag
+de compilacion NODE_ROLE) que se comunican mediante modulacion LoRa en la banda
+de 915 MHz usando un protocolo tokenizado con el separador '|', un backend en
+Python que procesa los datos via puerto Serial USB, y un dashboard web Angular
+que visualiza todas las metricas del enlace en tiempo real via WebSocket.
+
+El sistema soporta comunicacion BIDIRECCIONAL completa:
+  - Ambos nodos pueden transmitir paquetes de telemetria (DATA) y recibirlos
+  - Ambos nodos responden automaticamente con ACK al recibir DATA
+  - Ambos nodos soportan mensajeria de chat (CHAT) con confirmacion (CHAT_ACK)
+  - La latencia se mide en tiempo real mediante tabla RTT circular
+  - El heartbeat periodico reporta estado online/offline de ambos nodos
+
+Protocolo de comunicacion simetrico:
+  - DATA|<id>|<payload>    -> Paquete de telemetria (enviado cada ~1s)
+  - ACK|<id>|<rssi>|<snr>|<freqErr>    -> Confirmacion de recepcion
+  - CHAT|<id>|<texto>      -> Mensaje de chat
+  - CHAT_ACK|<id>          -> Confirmacion de mensaje chat
 
 El objetivo principal es analizar y monitorear la calidad del enlace de
-radiofrecuencia, midiendo parametros como RSSI, SNR, latencia y perdida de
-paquetes, y presentandolos de forma grafica e intuitiva.
-
-Protocolo de sincronizacion TX -> RX:
-  El transmisor envia por el aire un payload con formato:
-       <ID_secuencial>|<mensaje>
-  Ejemplo: "1|radioenlace exitoso", "2|radioenlace exitoso", ...
-  El receptor extrae el ID antes del token '|' para garantizar sincronizacion
-  matematica absoluta del numero de paquete, y el texto despues del token se
-  transmite como dato crudo (raw data) al dashboard.
+radiofrecuencia de forma bidireccional, midiendo parametros como RSSI, SNR,
+Frequency Error, latencia real RTT y perdida de paquetes, y presentandolos
+de forma grafica e intuitiva en el dashboard web.
 
 
 2. ARQUITECTURA DEL SISTEMA
@@ -30,32 +36,39 @@ Protocolo de sincronizacion TX -> RX:
 
 Flujo de datos:
 
-  +------------------+         LoRa 915 MHz         +------------------+
-  |  TRANSMISOR TX   | ---------------------------> |  RECEPTOR RX     |
-  |  Heltec LoRa 32  |   token: "N|radioenlace      |  Heltec LoRa 32  |
-  |  V3 + SX1262     |           exitoso"           |  V3 + SX1262     |
+                          LoRa 915 MHz (bidireccional)
+  +------------------+                              +------------------+
+  |  NODO LORA (TX)  | <--------------------------> |  NODO LORA (RX)  |
+  |  Heltec LoRa 32  |   DATA / ACK / CHAT / ACK    |  Heltec LoRa 32  |
+  |  V3 + SX1262     |                              |  V3 + SX1262     |
   +------------------+                              +--------+---------+
         |                                                      |
-   Solo envia,                                             USB Serial
-   sin pantalla                                           115200 baud
-   (TX = 14 dBm)                                                |
-                                                    +----------v----------+
-                                                    |  BACKEND            |
-                                                    |  Python FastAPI     |
-                                                    |  + Serial Reader    |
-                                                    |  + WebSocket Server |
-                                                    |  + REST API         |
-                                                    +----------+----------+
-                                                               |
-                                                        WebSocket
-                                                    ws://localhost:8000/ws
-                                                               |
-                                                    +----------v----------+
-                                                    |  FRONTEND           |
-                                                    |  Angular 21 +       |
-                                                    |  Tailwind CSS +     |
-                                                    |  ApexCharts         |
-                                                    +---------------------+
+    USB Serial                                             USB Serial
+    115200 baud                                            115200 baud
+        |                                                      |
+        |  (Solo el RX esta conectado al backend actualmente)  |
+        |                                                      |
+        +------------------------------------------------------+
+                                |
+                    USB Serial (COM4, 115200 baud)
+                                |
+                     +----------v----------+
+                     |  BACKEND            |
+                     |  Python FastAPI     |
+                     |  + Serial Reader    |
+                     |  + WebSocket Server |
+                     |  + REST API         |
+                     +----------+----------+
+                                |
+                         WebSocket
+                     ws://localhost:8000/ws
+                                |
+                     +----------v----------+
+                     |  FRONTEND           |
+                     |  Angular 21 +       |
+                     |  Tailwind CSS +     |
+                     |  ApexCharts         |
+                     +---------------------+
 
 
 3. HARDWARE UTILIZADO
@@ -72,67 +85,495 @@ Transceptor de radio:
   - Tasa de codificacion (CR): 4/5
   - Potencia de transmision: 14 dBm
 
-Pantalla (solo en nodo receptor):
+Pantalla (solo en nodo configurado como RX):
   - SSD1306 128x64 OLED (I2C), controlada con U8g2lib
   - Pines I2C: SCL=18, SDA=17, RST=21
 
-Pines SX1262 (ambos nodos):
+Pines SX1262 (ambos nodos, definidos en lora_node.h):
   - NSS=8, SCK=9, MOSI=10, MISO=11, RST=12, BUSY=13, DIO1=14
 
 
 4. FIRMWARE (MICROCONTROLADORES)
 --------------------------------------------------------------------------------
 
-4.1 Nodo Transmisor (firmware/transmitter/transmitter.ino)
-     - Inicializa el transceptor SX1262 en modo LoRa a 915 MHz.
-     - Configura potencia de salida: 14 dBm.
-     - NO tiene pantalla OLED (solo LED_BUILTIN como testigo).
-     - Cada 1 segundo (PACKET_INTERVAL_MS = 1000) transmite un paquete con:
-         radio.transmit(payload)
-     - El payload usa formato tokenizado con '|':
-         snprintf(payload, sizeof(payload), "%lu|radioenlace exitoso", packetCounter);
-       El resultado en el aire es: "1|radioenlace exitoso", "2|radioenlace exitoso", ...
-     - packetCounter es un contador secuencial (1, 2, 3, ...).
-     - Reporta por Serial (115200 baud) logs de depuracion con ID y estado de TX.
-     - Led_BUILTIN se enciende durante la transmision y se apaga al terminar.
-     - Librerias: RadioLib (exclusivamente).
+Ubicacion: firmware/node/
 
-4.2 Nodo Receptor (firmware/receiver/receiver.ino)
-     - Inicializa el SX1262 en modo LoRa a 915 MHz (mismos parametros RF).
-     - Inicializa la pantalla OLED SSD1306 via I2C con U8g2lib.
-     - Ejecuta nvs_flash_erase() + nvs_flash_init() al arranque para limpiar
-       almacenamiento no volatil del ESP32.
-     - Entra en modo de escucha continua: radio.receive(payload).
-     - Al recibir un paquete:
-        a. Extrae RSSI, SNR y Frequency Error del transceptor SX1262.
-        b. Aplica ALGORITMO DE APERTURA DEL TOKEN '|':
-           - Busca el caracter '|' en el payload.
-           - Lo que esta ANTES del token es el packet_id (numero).
-           - Lo que esta DESPUES del token es el cleanData (texto crudo).
-           - Si no encuentra token, usa packetsReceived como ID de respaldo.
-        c. Imprime un JSON por puerto Serial (115200 baud) con la estructura:
-           {
-             "type": "telemetry",
-             "rssi": <int>,
-             "snr": <float>,
-             "latency_ms": <int, random(4,9)>,
-             "packet_id": <ID extraido del token>,
-             "frequency_error": <float>,
-             "data": "<texto despues del token>"
-           }
-     - La latencia reportada es hardcodeada (random(4, 9) ms) por ser una
-       calibracion de laboratorio de mesa donde TX y RX estan muy cerca.
-     - Cada 5 segundos envia un heartbeat:
-       {
-         "type": "heartbeat",
-         "status": "online",
-         "uptime": <segundos>,
-         "packets_rx": <total recibidos>,
-         "rssi": <ultimo RSSI>,
-         "snr": <ultimo SNR>
-       }
-     - Actualiza la pantalla OLED con: ID sincronizado, RSSI, SNR, total RX.
-     - Librerias: RadioLib, U8g2lib, nvs_flash.
+El firmware ha sido disenado con una arquitectura modular y simetrica: UN solo
+codigo fuente compila para ambos roles (TX y RX) cambiando la directiva
+#define NODE_ROLE NODE_ROLE_TX  o  NODE_ROLE NODE_ROLE_RX
+
+4.1 Estructura modular
+
+  node.ino                 - Punto de entrada unificado. setup() y loop().
+  lora_node.h / .cpp       - Constantes, estructuras de datos, parseo de
+                             protocolo tokenizado, builders de payloads.
+  radio_manager.h / .cpp   - Inicializacion y control del transceptor SX1262.
+                             Recepcion por interrupcion DIO1. Transmision con
+                             reanudacion automatica de escucha.
+  serial_handler.h / .cpp  - Buffer de entrada Serial (256 bytes). Comando
+                             SEND: para envio de chat. Recepcion de mensajes
+                             CHAT con respuesta CHAT_ACK automatica.
+  telemetry_manager.h/.cpp - Heartbeat periodico (cada 5s). Envio de DATA
+                             periodico con jitter aleatorio. Recepcion de DATA
+                             con respuesta ACK automatica. Tabla RTT circular
+                             para medicion de latencia real.
+  display_manager.h / .cpp - Control de pantalla OLED SSD1306 via U8g2lib.
+                             Solo activo cuando NODE_ROLE == NODE_ROLE_RX.
+
+4.2 node.ino - Punto de entrada
+
+  setup():
+    1. Inicializa Serial a 115200 baud.
+    2. Configura LED_BUILTIN como salida.
+    3. Llama a displayManagerBegin() y muestra pantalla de inicio con el rol.
+    4. Llama a radioBegin() que:
+       - Inicializa el SX1262 con los parametros RF definidos en lora_node.h.
+       - Configura la interrupcion DIO1 para recepcion no bloqueante.
+       - Llama a radio.startReceive() para entrar en modo escucha continua.
+       - Si falla la inicializacion, entra en loop de parpadeo de error.
+    5. Imprime por Serial el rol asignado (TX o RX).
+
+  loop():
+    1. serviceLedBlink() - Apaga LED despues de 20ms no bloqueante.
+    2. serialHandlerPoll() - Procesa comandos del puerto Serial.
+    3. radioPacketAvailable() - Verifica flag de interrupcion DIO1.
+       Si hay paquete:
+         a. radioReadPacket(raw) - Lee el payload del SX1262.
+         b. Segun prefijo del payload:
+              CHAT_ACK| -> serialHandlerOnChatAckReceived()
+              CHAT|     -> serialHandlerOnChatReceived()
+              ACK|      -> telemetryManagerOnAckReceived()
+              DATA|     -> telemetryManagerOnDataReceived() + displayManagerUpdate()
+              otro      -> log de advertencia ("prefijo desconocido")
+         c. radioResumeReceive() - Vuelve a modo escucha.
+    4. telemetryManagerPoll() - Gestiona envio periodico y heartbeat.
+
+4.3 lora_node.h / .cpp - Protocolo y estructuras comunes
+
+  Constantes de radiofrecuencia (defines):
+    LORA_FREQUENCY         = 915.0 MHz
+    LORA_BANDWIDTH         = 125.0 kHz
+    LORA_SPREADING_FACTOR  = 7
+    LORA_CODING_RATE       = 5
+    LORA_TX_POWER          = 14 dBm
+
+  Constantes de timing:
+    TX_INTERVAL_BASE_MS    = 1000 ms (intervalo base entre transmisiones DATA)
+    TX_INTERVAL_JITTER_MS  = 100 ms  (jitter aleatorio anti-colision)
+    HEARTBEAT_INTERVAL_MS  = 5000 ms (intervalo de heartbeat)
+    RTT_TABLE_SIZE         = 8 slots (tabla circular para medicion de latencia)
+
+  Prefijos de protocolo tokenizado:
+    LORA_PREFIX_DATA     = "DATA|"
+    LORA_PREFIX_ACK      = "ACK|"
+    LORA_PREFIX_CHAT     = "CHAT|"
+    LORA_PREFIX_CHAT_ACK = "CHAT_ACK|"
+
+  Estructuras de datos:
+    DataPacket { uint32_t id; char payload[48]; }
+    AckPacket  { uint32_t id; int16_t rssi; float snr; float freqError; }
+    ChatPacket { uint32_t id; char text[64]; }
+
+  Funciones de parseo:
+    nextField(str, cursor, outField)
+      - Escanea token por token usando '|' como separador.
+      - Log de error si cursor fuera de rango (skill: error visible).
+      - Retorna false si no encuentra el separador.
+
+    parseDataPacket(raw, pkt)
+      - Valida prefijo "DATA|" (log de error si invalido).
+      - Extrae id numerico y payload string.
+      - Trunca payload si excede sizeof(pkt.payload) con WARN log.
+      - Retorna false si campos vacios o malformados.
+
+    parseAckPacket(raw, pkt)
+      - Valida prefijo "ACK|".
+      - Extrae 4 campos: id, rssi, snr, freqError.
+      - Cada campo validado individualmente con log de error.
+      - Retorna false si algun campo falta.
+
+    parseChatPacket(raw, pkt)
+      - Valida prefijo "CHAT|".
+      - Extrae id y texto del mensaje.
+      - Trunca texto si excede sizeof(pkt.text) con WARN log.
+
+    parseChatAckId(raw, id)
+      - Valida prefijo "CHAT_ACK|".
+      - Extrae el id del mensaje confirmado.
+
+  Funciones builder (construyen payloads para transmitir):
+    buildDataPayload(id, payload)     -> "DATA|<id>|<payload>"
+    buildAckPayload(id, rssi, snr, freqError) -> "ACK|<id>|<rssi>|<snr>|<freqError>"
+    buildChatPayload(id, text)        -> "CHAT|<id>|<text>"
+    buildChatAckPayload(id)           -> "CHAT_ACK|<id>"
+
+4.4 radio_manager.h / .cpp - Control del SX1262
+
+  Variables internas:
+    static SX1262 radio = new Module(NSS, DIO1, RST, BUSY)
+    static volatile bool receivedFlag = false (modificada por ISR)
+
+  Funcion ISR:
+    void IRAM_ATTR onLoRaReceive()
+      - Establece receivedFlag = true (ISR minima, no bloqueante).
+
+  Funcion interna:
+    transmitAndResume(payload, originFn)
+      - Cifra el payload con cryptoEncrypt() ANTES de transmitir.
+        - Genera nonce aleatorio de 8 bytes.
+        - Aplica AES-128 CTR sobre el texto plano.
+        - Prepara buffer: [8 bytes nonce][ciphertext].
+      - Si cryptoEncrypt() falla, log de error especifico y retorna false
+        (no se transmite nada).
+      - Llama a radio.transmit(cipherBuf, cipherLen) — transmite bytes
+        cifrados, no texto plano.
+      - Log de error con nombre de funcion y codigo RadioLib si falla.
+      - Resetea receivedFlag = false.
+      - Llama a radio.startReceive() para reanudar escucha.
+      - Log de error si startReceive falla.
+      - Retorna true solo si transmit fue exitoso.
+
+  Funciones publicas:
+    radioBegin()
+      - radio.begin(FREQ, BW, SF, CR) - Inicializa modulo.
+      - Log de error si falla y retorna false.
+      - radio.setOutputPower(14) - Configura potencia.
+      - radio.setDio1Action(onLoRaReceive) - Asigna ISR.
+      - radio.startReceive() - Inicia escucha.
+      - Retorna false si algun paso falla.
+
+    radioPacketAvailable()
+      - Lee y resetea receivedFlag.
+      - Retorna true si hay paquete pendiente.
+
+    radioReadPacket(payload)
+      - radio.getPacketLength() - Obtiene longitud real del paquete recibido.
+      - Si packetLen == 0, log WARN y retorna false.
+      - Si packetLen > CRYPTO_MAX_PACKET_SIZE (128), log ERROR y retorna false.
+      - radio.readData(cipherBuf, packetLen) - Lee bytes cifrados del SX1262.
+      - Log de error si readData falla.
+      - Descifra con cryptoDecrypt(cipherBuf, packetLen, payload):
+        - Extrae nonce de los primeros 8 bytes.
+        - Aplica AES-128 CTR sobre el ciphertext.
+        - Reconstruye el string de texto plano.
+      - Si cryptoDecrypt() falla, log ERROR y retorna false
+        (el paquete no pudo descifrarse — posible clave incorrecta o
+         interferencia que corrompio los datos).
+      - Log de WARN si payload vacio tras descifrar.
+      - Retorna false en caso de error.
+
+    radioResumeReceive()
+      - radio.startReceive() - Reanuda escucha.
+      - Log de error si falla.
+
+    radioSendData(id, payload)
+      - Construye payload DATA con buildDataPayload().
+      - Llama a transmitAndResume().
+
+    radioSendAck(id, rssi, snr, freqError)
+      - Construye payload ACK con buildAckPayload().
+      - Llama a transmitAndResume().
+
+    radioSendChat(id, text)
+      - Construye payload CHAT con buildChatPayload().
+      - Llama a transmitAndResume().
+
+    radioSendChatAck(id)
+      - Construye payload CHAT_ACK con buildChatAckPayload().
+      - Llama a transmitAndResume().
+
+    radioGetLastRSSI()       -> radio.getRSSI()
+    radioGetLastSNR()        -> radio.getSNR()
+    radioGetLastFreqError()  -> radio.getFrequencyError()
+
+4.5 serial_handler.h / .cpp - Manejo de comandos Serial y Chat
+
+  Variables internas:
+    serialBuffer     - Buffer de entrada Serial (max 256 chars)
+    nextChatId       - Contador secuencial de mensajes de chat
+    lastSentChatId   - ID del ultimo CHAT enviado
+    awaitingChatAck  - Flag de espera de confirmacion
+
+  Funcion publica:
+    serialHandlerPoll()
+      - Lee caracteres del Serial hasta encontrar '\n'.
+      - Si el comando empieza con "SEND:" y tiene contenido:
+        1. Incrementa nextChatId.
+        2. Almacena lastSentChatId y activa awaitingChatAck = true.
+        3. Llama a radioSendChat(id, msg).
+        4. Log de exito o error del envio.
+      - Si el buffer excede 256 caracteres, log WARN y descarta.
+      - Resetea buffer al terminar cada linea.
+
+    serialHandlerOnChatReceived(raw)
+      - Parsea el payload con parseChatPacket().
+      - Si falla, retorna (el parseo ya logueo el error especifico).
+      - Obtiene RSSI y SNR del ultimo paquete recibido.
+      - Imprime JSON por Serial:
+          {"type":"chat","message":"<texto>","rssi":<int>,"snr":<float>}
+      - Envia CHAT_ACK automaticamente con radioSendChatAck().
+      - Log de error si falla el envio del ACK.
+
+    serialHandlerOnChatAckReceived(raw)
+      - Parsea el id con parseChatAckId().
+      - Si falla, retorna.
+      - Si awaitingChatAck y el id coincide con lastSentChatId:
+        - Marca awaitingChatAck = false.
+        - Imprime confirmacion por Serial.
+      - Si no coincide, log informativo.
+
+4.6 telemetry_manager.h / .cpp - Gestion de telemetria y heartbeat
+
+  Variables internas:
+    rttTable[RTT_TABLE_SIZE] - Tabla circular de 8 slots para RTT
+    rttCursor                - Indice actual en tabla RTT
+    lastPacketTime           - Timestamp del ultimo DATA enviado
+    lastHeartbeat            - Timestamp del ultimo heartbeat
+    currentInterval          - Intervalo actual (con jitter)
+    packetsTx                - Contador de paquetes transmitidos
+    packetsRx                - Contador de paquetes recibidos
+    lastRSSI                 - Ultimo RSSI medido
+    lastSNR                  - Ultimo SNR medido
+    lastPacketId             - ID del ultimo paquete recibido
+
+  Funciones internas:
+    rttTableInsert(id)
+      - Registra el timestamp actual (millis()) asociado al ID.
+      - Avanza cursor circular.
+
+    rttTableTakeLatency(id, latencyOut)
+      - Busca el slot con el ID dado.
+      - Calcula latencia = millis() - sendTime.
+      - Marca slot como no usado.
+      - Retorna true si encontro el ID.
+
+    nextInterval()
+      - Calcula TX_INTERVAL_BASE_MS + random(-JITTER, JITTER+1).
+      - Retorna el intervalo con jitter (900-1100ms).
+
+  Funcion publica:
+    telemetryManagerPoll()
+      - Si ha pasado currentInterval desde ultimo envio DATA:
+        1. Actualiza lastPacketTime = millis().
+        2. Calcula nuevo currentInterval con nextInterval().
+        3. Incrementa packetsTx.
+        4. Llama a radioSendData(packetsTx, "radioenlace exitoso").
+        5. Si exito, inserta en tabla RTT con rttTableInsert().
+        6. Si falla, log de error.
+      - Si han pasado HEARTBEAT_INTERVAL_MS (5s) desde ultimo heartbeat:
+        Imprime JSON:
+          {"type":"heartbeat","status":"online","uptime":<s>,
+           "packets_tx":<N>,"packets_rx":<N>,"rssi":<int>,"snr":<float>}
+
+    telemetryManagerOnDataReceived(raw)
+      - Parsea payload DATA con parseDataPacket().
+      - Si falla, retorna.
+      - Incrementa packetsRx.
+      - Lee RSSI, SNR y Frequency Error del SX1262.
+      - Almacena lastPacketId.
+      - Imprime JSON:
+          {"type":"telemetry","rssi":<int>,"snr":<float>,"latency_ms":0,
+           "packet_id":<id>,"frequency_error":<float>,"data":"<payload>"}
+        NOTA: latency_ms se envia como 0 porque quien recibe el DATA
+        no puede medir latencia; quien la informa es el nodo que recibe
+        el ACK (ahi se calcula el RTT real).
+      - Envia ACK automaticamente con radioSendAck(id, rssi, snr, freqErr).
+      - Log de error si falla el envio del ACK.
+
+    telemetryManagerOnAckReceived(raw)
+      - Parsea payload ACK con parseAckPacket().
+      - Si falla, retorna.
+      - Busca latencia en tabla RTT con rttTableTakeLatency().
+      - Si no encuentra el ID, log WARN ("ACK sin envio pendiente").
+      - Imprime JSON:
+          {"type":"telemetry","rssi":<rssi_del_ACK>,"snr":<snr_del_ACK>,
+           "latency_ms":<RTT_real>,"packet_id":<id>,
+           "frequency_error":<freq_del_ACK>,"data":"radioenlace exitoso"}
+      - NOTA: Este JSON es el que realmente contiene la latencia real
+        medida desde que se envio el DATA hasta que llego el ACK.
+
+    Funciones de consulta:
+      telemetryManagerPacketsTx()    -> packetsTx
+      telemetryManagerPacketsRx()    -> packetsRx
+      telemetryManagerLastRSSI()     -> lastRSSI
+      telemetryManagerLastSNR()      -> lastSNR
+      telemetryManagerLastPacketId() -> lastPacketId
+
+4.7 display_manager.h / .cpp - Pantalla OLED
+
+  Variables internas:
+    static U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(R0, RST=21, SCL=18, SDA=17)
+
+  Funciones publicas:
+    displayManagerBegin()
+      - Inicializa pantalla con u8g2.begin().
+      - Configura fuente u8g2_font_6x10_tf.
+
+    displayManagerShowMessage(line1, line2)
+      - Muestra mensaje de dos lineas en pantalla.
+      - Usado en setup() para mostrar el rol (TX/RX).
+
+    displayManagerUpdate()
+      - Lee metricas actuales via telemetryManager*().
+      - Construye 4 lineas de informacion:
+        Linea 1: "--- TELEMETRIA ---"
+        Linea 2: "ID: <ultimo_packet_id>"
+        Linea 3: "RSSI: <valor> dBm"
+        Linea 4: "SNR: <valor> dB"
+        Linea 5: "TX:<tx_count> RX:<rx_count>"
+      - Renderiza en pantalla con u8g2.firstPage()/nextPage().
+
+4.8 Mejoras implementadas respecto a la version anterior
+
+  | Caracteristica      | Version anterior                    | Version actual                      |
+  |---------------------|-------------------------------------|-------------------------------------|
+  | Arquitectura        | 2 firmwares separados (asimétricos) | 1 firmware unificado (symmetric)    |
+  | Latencia            | random(4,9) (falsa)                 | Real: tabla RTT circular 8 slots    |
+  | CHAT con ACK        | No                                  | Si: CHAT_ACK|id automatico         |
+  | Delay bloqueante    | delay(20) en RX                     | LED no bloqueante con millis()      |
+  | nvs_flash_erase()   | Cada boot                           | Eliminado                           |
+  | Timer CHAT          | Reseteaba lastPacketTime            | Timers independientes               |
+  | Anti-colision       | No                                  | Jitter aleatorio ±100ms             |
+  | Log de errores      | Minimo                              | Cada operacion RadioLib validada    |
+  | Separacion modulos  | Monolitico                          | 6 modulos con responsabilidad unica |
+  | Display OLED        | Solo RX                             | RX condicional por NODE_ROLE        |
+
+4.9 Medicion de latencia real (RTT)
+
+  (el contenido existente de 4.9 se mantiene intacto)
+
+4.10 crypto_manager.h / .cpp - Cifrado AES-128 CTR de capa de radio
+
+  Propósito:
+    Proveer confidencialidad en el enlace LoRa mediante cifrado simétrico
+    AES-128 en modo CTR (Counter), utilizando la implementación mbedtls
+    del core ESP32 (acelerada por hardware, sin librerías adicionales que
+    instalar).
+
+  Diseño:
+    El cifrado es completamente transparente al resto del firmware. Solo
+    radio_manager.cpp invoca cryptoEncrypt() justo antes de transmitir y
+    cryptoDecrypt() justo después de recibir. node.ino, lora_node.*,
+    serial_handler.*, telemetry_manager.* y display_manager.* no saben
+    que existe cifrado — siguen viendo las mismas cadenas "DATA|...",
+    "ACK|...", "CHAT|..." de siempre.
+
+  Clave precompartida (AES_KEY):
+    - Definida como array estático const uint8_t[16] en crypto_manager.cpp.
+    - Valor actual: "LoRa-Enlace-2026" en ASCII (0x4C, 0x6F, ...).
+    - Debe ser idéntica en AMBAS placas (lo es por compartir el mismo código).
+    - Si se cambia, hay que reflashear ambos nodos simultáneamente. Una
+      placa con clave distinta no podrá descifrar los paquetes de la otra.
+
+  Formato del paquete cifrado en el aire:
+    [8 bytes nonce aleatorio][cifrado AES-CTR del payload de texto plano]
+    Longitud total = 8 + len(texto_plano) bytes.
+    - Nonce: 8 bytes generados con random(0,256) por cada transmisión.
+      Garantiza que paquetes idénticos (ej. ACKs consecutivos con los
+      mismos valores de RSSI/SNR) produzcan texto cifrado diferente cada
+      vez (seguridad semántica — cifrado probabilista).
+    - Cifrado: AES-CTR sin padding. El ciphertext tiene exactamente la
+      misma longitud que el plaintext. No se añade overhead de relleno.
+
+  Constantes (defines en crypto_manager.h):
+    CRYPTO_NONCE_SIZE      = 8 bytes
+    CRYPTO_MAX_PACKET_SIZE = 128 bytes (límite superior para cualquier
+                             payload del protocolo LoRa)
+
+  Funciones públicas:
+
+    cryptoEncrypt(plaintext, outBuf, outLen, maxOutLen)
+      1. Verifica que CRYPTO_NONCE_SIZE + plaintext.length() <= maxOutLen.
+         Si no, log de error y retorna false.
+      2. Genera nonce aleatorio de 8 bytes con bucle for y random(0, 256).
+      3. Llama a aesCtrCrypt() con el plaintext, el nonce y el output
+         apuntando a outBuf + CRYPTO_NONCE_SIZE (deja espacio para el nonce).
+      4. Copia el nonce al inicio de outBuf con memcpy().
+      5. Establece outLen = CRYPTO_NONCE_SIZE + len.
+      6. Retorna false si aesCtrCrypt falló.
+
+    cryptoDecrypt(inBuf, inLen, outPlaintext)
+      1. Verifica que inLen > CRYPTO_NONCE_SIZE. Si no, log de error y
+         retorna false (no hay suficiente datos para contener nonce).
+      2. Calcula cipherLen = inLen - CRYPTO_NONCE_SIZE.
+      3. Verifica que cipherLen < CRYPTO_MAX_PACKET_SIZE.
+      4. Llama a aesCtrCrypt() con el ciphertext (inBuf + CRYPTO_NONCE_SIZE),
+         el nonce (inBuf), y un buffer local plainBuf[].
+      5. Reconstruye el String outPlaintext iterando plainBuf byte a byte.
+      6. Retorna false si aesCtrCrypt falló.
+
+  Función interna:
+
+    aesCtrCrypt(input, len, nonce, output, originFn)
+      - Parámetros:
+          input    -> puntero a los datos de entrada (plaintext o ciphertext)
+          len      -> longitud de los datos
+          nonce    -> puntero a los 8 bytes de nonce
+          output   -> puntero al buffer de salida (debe tener al menos len bytes)
+          originFn -> string con el nombre de la función llamante para logs
+      - Proceso:
+        1. Inicializa contexto mbedtls_aes_context con mbedtls_aes_init().
+        2. Configura clave con mbedtls_aes_setkey_enc(&aes, AES_KEY, 128).
+           Si falla (codigo != 0), log de error con originFn y codigo,
+           libera contexto y retorna false.
+        3. Construye nonceCounter[16] = nonce[8] || {0,0,0,0,0,0,0,0}
+           (los 8 bytes superiores del contador se inicializan a cero).
+        4. Prepara streamBlock[16] = {0} y nc_off = 0 (estado interno CTR).
+        5. Llama a mbedtls_aes_crypt_ctr(&aes, len, &nc_off, nonceCounter,
+           streamBlock, input, output).
+           Si falla, log de error con originFn y codigo.
+        6. Libera contexto con mbedtls_aes_free(&aes).
+      - Retorna true solo si ambas operaciones mbedtls fueron exitosas.
+      - NOTA: AES-CTR usa la misma función para cifrar y descifrar
+        (la operación es simétrica: CTR(key, nonce, XOR data)). Por eso
+        aesCtrCrypt sirve tanto para cryptoEncrypt como cryptoDecrypt.
+
+  Seguridad:
+    - Algoritmo: AES-128 en modo CTR.
+    - Clave: 128 bits (16 bytes), precompartida, fija en código.
+    - Nonce: 8 bytes aleatorios por paquete -> espacio de 2^64 valores
+      no repetidos antes de que el mismo nonce pueda reutilizarse con
+      la misma clave.
+    - Lo que protege: confidencialidad del contenido de los mensajes
+      LoRa. Un atacante que intercepte la señal RF no puede leer los
+      payloads sin conocer la clave AES.
+    - Lo que NO protege (limitaciones actuales):
+      * No hay autenticación ni integridad (no se usa MAC). Un atacante
+        podría modificar o inyectar paquetes cifrados (no sabría qué
+        contenido está inyectando, pero podría causar ruido).
+      * No hay protección contra replay: un atacante puede re-transmitir
+        un paquete capturado y el receptor lo descifrará correctamente.
+      * La clave está hardcodeada en el firmware (no es derivada de
+        contraseña ni intercambiada por protocolo).
+    - Para entornos que requieran también integridad/autenticación, se
+      puede migrar a AES-GCM (modo autenticado) en el futuro.
+
+  Dependencias:
+    - No requiere librerías externas. Usa mbedtls/aes.h del core ESP32
+      (parte de ESP-IDF, incluida automáticamente en el framework Arduino
+      para ESP32). La aceleración AES por hardware (esp_aes_crypt_ctr)
+      se activa automáticamente en el ESP32-S3.
+
+  El sistema mide la latencia de ida y vuelta (Round-Trip Time) de la siguiente
+  manera:
+
+  1. El nodo TX (emisor del DATA) registra el timestamp (millis()) en el
+     momento de transmitir el paquete DATA|<id>|...  mediante rttTableInsert().
+     La tabla RTT es circular de 8 slots, permitiendo tener hasta 8 envios
+     pendientes de confirmacion simultaneamente.
+
+  2. El nodo RX (receptor del DATA) al recibir el paquete:
+     - Lee RSSI, SNR y Frequency Error del SX1262.
+     - Imprime JSON por Serial con el payload recibido.
+     - Responde inmediatamente con ACK|<id>|<rssi>|<snr>|<freqErr>.
+
+  3. El nodo TX al recibir el ACK|<id>|...:
+     - Busca el ID en la tabla RTT con rttTableTakeLatency().
+     - Calcula latencia = millis()_actual - millis()_de_envio.
+     - Imprime JSON por Serial con la latencia real incluida.
+
+  Esto proporciona una medicion precisa del tiempo de ida y vuelta,
+  incluyendo tiempo de procesamiento en ambos nodos y propagacion RF.
 
 
 5. BACKEND (Python + FastAPI)
@@ -143,100 +584,101 @@ Ubicacion: backend/app/
 5.1 Componentes principales
 
     main.py               - Punto de entrada. Inicia FastAPI con lifespan.
-                           - Crea TelemetryService (buffer de paquetes),
-                             SocketManager (conexiones WebSocket) y
-                             LoRaSerialReader (lector de puerto serial).
-                           - Define 3 callbacks que conectan el lector serial
-                             con el broadcast WebSocket:
-                               on_serial_data()   -> parsea y transmite telemetria
-                               on_heartbeat()     -> actualiza estado online del RX
-                               on_serial_status() -> notifica estado del puerto serial
-                           - Endpoints:
-                               WebSocket /ws
-                               GET /  (health check con info de conexiones)
+                            - Crea TelemetryService (buffer de paquetes),
+                              SocketManager (conexiones WebSocket) y
+                              LoRaSerialReader (lector de puerto serial).
+                            - Define 4 callbacks que conectan el lector serial
+                              con el broadcast WebSocket:
+                                on_serial_data()   -> parsea y transmite telemetria
+                                on_heartbeat()     -> actualiza estado online
+                                on_chat_message()  -> reenvia mensajes chat
+                                on_serial_status() -> notifica estado del puerto
+                            - Endpoints:
+                                WebSocket /ws
+                                GET /  (health check con info de conexiones)
 
     config.py             - Constantes de configuracion:
-                             SERIAL_PORT = "COM4"
-                             BAUD_RATE = 115200
-                             BUFFER_SIZE = 1000 (historial de paquetes)
-                           - SIMULATED_MODE = not PYSERIAL_AVAILABLE
-                             (solo se activa si pyserial NO esta instalado)
+                              SERIAL_PORT = "COM4"
+                              BAUD_RATE = 115200
+                              BUFFER_SIZE = 1000 (historial de paquetes)
+                            - SIMULATED_MODE = not PYSERIAL_AVAILABLE
+                              (solo se activa si pyserial NO esta instalado)
 
     serial_reader/lora_serial.py
-                           - Lee datos del puerto Serial USB en un hilo separado
-                             (daemon thread).
-                           - Modo REAL: abre COM4 a 115200 baud, lee lineas
-                             JSON via readline(). Si el puerto falla, reintenta
-                             hasta 5 veces (con 3s de espera). Si agota los
-                             reintentos, aborta. NO hay fallback a simulacion
-                             en runtime.
-                           - Modo SIMULADO: solo se activa al inicio si pyserial
-                             no esta instalado. Genera datos aleatorios realistas.
-                           - Notifica eventos de conexion/desconexion/error del
-                             puerto serial al frontend via WebSocket
-                             (tipo "serial_status").
+                            - Lee datos del puerto Serial USB en un hilo separado
+                              (daemon thread).
+                            - Modo REAL: abre COM4 a 115200 baud, lee lineas
+                              JSON via readline(). Si el puerto falla, reintenta
+                              hasta 5 veces (con 3s de espera). Si agota los
+                              reintentos, aborta.
+                            - Modo SIMULADO: solo se activa al inicio si pyserial
+                              no esta instalado. Genera datos aleatorios realistas.
+                            - Soporta envio de mensajes de chat via metodo
+                              send_message(text) que escribe "SEND:text\n" al
+                              puerto serial.
+                            - Notifica eventos de conexion/desconexion/error del
+                              puerto serial al frontend via WebSocket
+                              (tipo "serial_status").
 
     services/telemetry_service.py
-                           - Almacena el buffer circular de ultimos 1000 paquetes
-                             usando collections.deque(maxlen=1000).
-                           - Detecta paquetes perdidos por saltos en IDs
-                             secuenciales.
-                           - Calcula tasa de perdida de paquetes (%).
-                           - Mantiene el estado global del sistema:
-                             tx_online, rx_online, packets_sent, packets_received,
-                             packets_lost, packet_loss_pct, uptime_seconds,
-                             latest_rssi, latest_snr, link_state.
-                           - Clasifica link_state segun umbrales RSSI:
-                               EXCELENTE: >= -60 dBm
-                               BUENA:     >= -80 dBm
-                               REGULAR:   >= -100 dBm
-                               MARGINAL:  >= -115 dBm
-                               CRITICA:   < -115 dBm
+                            - Almacena el buffer circular de ultimos 1000 paquetes
+                              usando collections.deque(maxlen=1000).
+                            - Detecta paquetes perdidos por saltos en IDs
+                              secuenciales.
+                            - Calcula tasa de perdida de paquetes (%).
+                            - Mantiene el estado global del sistema:
+                              tx_online, rx_online, packets_sent, packets_received,
+                              packets_lost, packet_loss_pct, uptime_seconds,
+                              latest_rssi, latest_snr, link_state.
+                            - Clasifica link_state segun umbrales RSSI:
+                                EXCELENTE: >= -60 dBm
+                                BUENA:     >= -80 dBm
+                                REGULAR:   >= -100 dBm
+                                MARGINAL:  >= -115 dBm
+                                CRITICA:   < -115 dBm
 
     utils/parser.py       - Parsea las lineas JSON del serial.
-                           - Calcula metricas derivadas:
-                               * signal_strength_pct(): RSSI mapeado de
-                                 -120 a -20 dBm -> 0% a 100%
-                               * link_quality(): clasificacion categorica
-                                 basada en RSSI + SNR:
-                                   EXCELENTE: RSSI >= -60 AND SNR >= 10
-                                   BUENA:     RSSI >= -80 AND SNR >= 5
-                                   REGULAR:   RSSI >= -100 AND SNR >= 0
-                                   MARGINAL:  RSSI >= -115
-                                   CRITICA:   caso contrario
-                               * distance_approx(): distancia estimada
-                                 mediante formula FSPL (Free Space Path Loss)
-                           - parse_serial_line(): convierte JSON crudo del
-                             serial en objeto TelemetryPacket (Pydantic).
-                           - build_status(): construye SystemStatus desde el
-                             estado del TelemetryService.
+                            - Calcula metricas derivadas:
+                                * signal_strength_pct(): RSSI mapeado de
+                                  -120 a -20 dBm -> 0% a 100%
+                                * link_quality(): clasificacion categorica
+                                  basada en RSSI + SNR:
+                                    EXCELENTE: RSSI >= -60 AND SNR >= 10
+                                    BUENA:     RSSI >= -80 AND SNR >= 5
+                                    REGULAR:   RSSI >= -100 AND SNR >= 0
+                                    MARGINAL:  RSSI >= -115
+                                    CRITICA:   caso contrario
+                                * distance_approx(): distancia estimada
+                                  mediante formula FSPL (Free Space Path Loss)
+                            - parse_serial_line(): convierte JSON crudo del
+                              serial en objeto TelemetryPacket (Pydantic).
 
     models/telemetry_model.py
-                           - Modelos Pydantic para validacion de datos:
-                             TelemetryPacket: packet_id, rssi, snr, latency_ms,
-                               signal_strength_pct, link_quality,
-                               distance_approx_m, frequency_error_hz,
-                               raw_data, timestamp
-                             SystemStatus: transmitter_online, receiver_online,
-                               packets_sent, packets_received, packets_lost,
-                               packet_loss_pct, uptime_seconds, latest_rssi,
-                               latest_snr, link_state, timestamp
-                             HistoricalRecord: lista de TelemetryPacket + total
+                            - Modelos Pydantic para validacion de datos:
+                              TelemetryPacket: packet_id, rssi, snr, latency_ms,
+                                signal_strength_pct, link_quality,
+                                distance_approx_m, frequency_error_hz,
+                                raw_data, timestamp
+                              SystemStatus: transmitter_online, receiver_online,
+                                packets_sent, packets_received, packets_lost,
+                                packet_loss_pct, uptime_seconds, latest_rssi,
+                                latest_snr, link_state, timestamp
+                              HistoricalRecord: lista de TelemetryPacket + total
 
     routes/telemetry_routes.py
-                           - API REST con prefijo /api:
-                             GET /api/telemetry/latest  -> ultimo paquete
-                             GET /api/telemetry/history?limit=N -> historial
-                             GET /api/status             -> estado del sistema
+                            - API REST con prefijo /api:
+                              GET /api/telemetry/latest  -> ultimo paquete
+                              GET /api/telemetry/history?limit=N -> historial
+                              GET /api/status             -> estado del sistema
 
     websocket/socket_manager.py
-                           - Gestiona conexiones WebSocket (Set[WebSocket]).
-                           - Al conectar un cliente, envia estado inicial del
-                             sistema: {"type": "init", "system": {...}}.
-                           - Transmite paquetes en tiempo real a todos los
-                             clientes conectados (broadcast).
-                           - Elimina conexiones muertas durante el broadcast.
-                           - Maneja desconexiones limpiamente.
+                            - Gestiona conexiones WebSocket (Set[WebSocket]).
+                            - Al conectar un cliente, envia estado inicial del
+                              sistema: {"type": "init", "system": {...}}.
+                            - Transmite paquetes en tiempo real a todos los
+                              clientes conectados (broadcast).
+                            - Elimina conexiones muertas durante el broadcast.
+                            - Maneja desconexiones limpiamente.
 
 5.2 Dependencias (requirements.txt)
     - fastapi==0.115.6
@@ -256,6 +698,7 @@ Ubicacion: frontend/src/app/
     - Estilos: Tailwind CSS 3.4 con tema oscuro personalizado
     - Graficos: ApexCharts 5.12 via ng-apexcharts 2.4
     - Estado: RxJS 7.8 (BehaviorSubject + Observables)
+    - Persistencia local: localStorage para historial de chat
     - Build: Angular CLI 21 con ESBuild/Vite
 
 6.2 Estructura de archivos y proposito
@@ -270,62 +713,98 @@ Ubicacion: frontend/src/app/
     src/app/app.ts                  - Componente raiz standalone, renderiza
                                       <router-outlet>.
     src/app/app.config.ts           - Configuracion de zona, router provider.
-    src/app/app.routes.ts           - Ruta unica "/" -> DashboardPageComponent,
+    src/app/app.routes.ts           - Ruta "/" -> DashboardPageComponent,
+                                      "/chat" -> RadioChatComponent,
                                       wildcard redirige a "/".
 
     src/app/core/models/telemetry.interface.ts
-                           - Interfaces TypeScript que duplican los modelos
-                             Pydantic del backend:
-                             TelemetryPacket (12 campos), SystemState (11 campos).
+                            - Interfaces TypeScript que duplican los modelos
+                              Pydantic del backend:
+                              TelemetryPacket (12 campos), SystemState (11 campos).
 
     src/app/services/websocket.service.ts
-                           - Cliente WebSocket: ws://localhost:8000/ws
-                           - Reconexion automatica cada 3 segundos.
-                           - Expone Observable messages$ con mensajes parseados.
-                           - Notifica estado de conexion.
+                            - Cliente WebSocket: ws://localhost:8000/ws
+                            - Reconexion automatica cada 3 segundos.
+                            - Expone Observable messages$ con mensajes parseados.
+                            - Buffer de mensajes pendientes para envio offline.
+                            - Metodo send() para enviar JSON al backend (usado
+                              para enviar mensajes de chat).
 
     src/app/services/telemetry.service.ts
-                           - Suscribe a messages$ y distribuye por tipo:
-                             "init"          -> actualiza systemState$
-                             "telemetry"     -> actualiza latestPacket$,
-                                                 history$ (buffer 100),
-                                                 systemState$
-                             "heartbeat"     -> actualiza estado online
-                             "serial_status" -> notifica eventos del puerto serial
-                           - Expone 4 Observables: latestPacket$, systemState$,
-                             history$, serialStatus$.
+                            - Suscribe a messages$ y distribuye por tipo:
+                              "init"          -> actualiza systemState$
+                              "telemetry"     -> actualiza latestPacket$,
+                                                  history$ (buffer 100),
+                                                  systemState$
+                              "heartbeat"     -> actualiza estado online
+                              "serial_status" -> notifica eventos del puerto serial
+                            - Expone 4 Observables: latestPacket$, systemState$,
+                              history$, serialStatus$.
+
+    src/app/services/chat.service.ts
+                            - Servicio de mensajeria de chat con persistencia
+                              local mediante localStorage.
+                            - Interfaz ChatMessage:
+                                text: string       - Contenido del mensaje
+                                direction: 'sent'|'received' - Direccion
+                                timestamp: Date    - Marca temporal
+                                rssi?: number      - RSSI al recibir (opcional)
+                                snr?: number       - SNR al recibir (opcional)
+                            - Almacena hasta MAX_STORED_MESSAGES = 200 mensajes
+                              en localStorage bajo la clave 'lora_chat_history'.
+                            - loadFromStorage(): Carga historial al iniciar el
+                              servicio. Parsea JSON y reconstruye objetos Date.
+                              En caso de error, log en consola y retorna [].
+                            - saveToStorage(): Guarda los ultimos 200 mensajes
+                              en localStorage. En caso de error, log en consola.
+                            - sendMessage(text): Agrega mensaje con direction
+                              'sent', llama a ws.send() con tipo "send_chat",
+                              y persiste inmediatamente.
+                            - Suscribe a mensajes tipo "chat" del WebSocket:
+                              agrega mensaje con direction 'received',
+                              incluye rssi/snr del backend, actualiza linkStatus
+                              y persiste.
+                            - linkStatus: string reactivo que muestra
+                              "RSSI: X dBm | SNR: Y dB" del ultimo chat recibido.
+
+    src/app/radio-chat/radio-chat.ts (componente de chat)
+                            - Interfaz de chat bidireccional en tiempo real.
+                            - Muestra historial de mensajes con indicacion
+                              de direccion (enviado/recibido).
+                            - Campo de entrada de texto para enviar mensajes.
+                            - Datos de RSSI/SNR del ultimo mensaje recibido.
 
     src/app/dashboard/pages/dashboard-page/dashboard-page.component.ts
-                           - Componente principal del dashboard (626 lineas).
-                           - Layout completo definido en el template inline.
-                           - Suscribe a streams de telemetria y calcula datos
-                             derivados (uptime, colores de calidad, etiquetas).
+                            - Componente principal del dashboard (622 lineas).
+                            - Layout completo definido en el template inline.
+                            - Suscribe a streams de telemetria y calcula datos
+                              derivados (uptime, colores de calidad, etiquetas).
 
     src/app/dashboard/components/signal-card/signal-card.component.ts
-                           - Tarjeta metrica individual con label, valor,
-                             unidad, badge de calidad y borde lateral coloreado.
+                            - Tarjeta metrica individual con label, valor,
+                              unidad, badge de calidad y borde lateral coloreado.
 
     src/app/dashboard/components/rssi-chart/rssi-chart.component.ts
-                           - Grafico de area (ApexCharts) con evolucion del
-                             RSSI en el tiempo (ultimos 60 puntos).
-                           - 4 lineas de anotacion horizontal en umbrales
-                             -60, -80, -100, -115 dBm.
+                            - Grafico de area (ApexCharts) con evolucion del
+                              RSSI en el tiempo (ultimos 60 puntos).
+                            - 4 lineas de anotacion horizontal en umbrales
+                              -60, -80, -100, -115 dBm.
 
     src/app/dashboard/components/signal-gauge/signal-gauge.component.ts
-                           - Medidor radial (ApexCharts radialBar) de 0% a 100%.
-                           - Color dinamico: verde >= 60%, ambar >= 30%,
-                             rojo < 30%.
+                            - Medidor radial (ApexCharts radialBar) de 0% a 100%.
+                            - Color dinamico: verde >= 60%, ambar >= 30%,
+                              rojo < 30%.
 
     src/app/dashboard/components/node-status/node-status.component.ts
-                           - Panel de estado de nodos TX y RX.
-                           - Circulos animados con efecto "pulse" (anillos
-                             expansivos) para nodo online.
-                           - Contadores de paquetes enviados/recibidos.
+                            - Panel de estado de nodos TX y RX.
+                            - Circulos animados con efecto "pulse" (anillos
+                              expansivos) para nodo online.
+                            - Contadores de paquetes enviados/recibidos.
 
     src/app/dashboard/components/packet-table/packet-table.component.ts
-                           - Tabla scrollable con ultimos 20 paquetes.
-                           - Columnas: ID, RSSI (coloreado), SNR, Latencia,
-                             Calidad (badge coloreado).
+                            - Tabla scrollable con ultimos 20 paquetes.
+                            - Columnas: ID, RSSI (coloreado), SNR, Latencia,
+                              Calidad (badge coloreado).
 
 6.3 Secciones visuales del Dashboard
 
@@ -345,7 +824,7 @@ Ubicacion: frontend/src/app/
        1. RSSI (dBm) - Potencia de senal recibida
        2. SNR (dB) - Relacion senal/ruido
        3. Perdida de Paquetes (%) - Paquetes perdidos / enviados
-       4. Latencia (ms) - Tiempo de viaje TX->RX
+       4. Latencia (ms) - Tiempo de viaje TX->RX (RTT real ahora)
 
     D. TARJETAS EXPANDIBLES DEL SIDEBAR (5 tarjetas)
        Cada una con barra de espectro, badge de calidad y panel
@@ -391,45 +870,96 @@ Ubicacion: frontend/src/app/
 7. COMO SE DA EL RADIOENLACE (FLUJO COMPLETO)
 --------------------------------------------------------------------------------
 
-7.1 Transmision (TX)
-    El transmisor (Heltec LoRa 32 V3) ejecuta un loop infinito donde cada
-    1000 ms:
-    a. Incrementa un contador secuencial (packetCounter).
-    b. Construye un payload con formato tokenizado:
-         snprintf(payload, "%lu|radioenlace exitoso", packetCounter)
-       Ejemplo: "1|radioenlace exitoso"
-    c. Enciende el LED_BUILTIN como testigo visual.
-    d. Llama a radio.transmit(payload) que:
-       - Codifica el string en paquetes LoRa (SF7, BW 125 kHz, CR 4/5).
-       - Modula la senal en 915 MHz.
-       - La transmite a 14 dBm de potencia por la antena integrada.
-    e. Apaga el LED_BUILTIN al terminar.
-    f. Reporta por Serial USB el ID y estado de la transmision.
+NOTA: Todos los paquetes que viajan por el aire (DATA, ACK, CHAT y
+CHAT_ACK) son CIFRADOS con AES-128 CTR antes de la transmisión y
+descifrados después de la recepción. El módulo crypto_manager inyecta
+el cifrado/descifrado exclusivamente en radio_manager.cpp, sin que
+el resto del firmware (node.ino, lora_node, serial_handler,
+telemetry_manager, display_manager) tenga conocimiento del cambio.
+El protocolo tokenizado '|' y el parseo de cadenas operan sobre texto
+plano tanto en TX como en RX, como si el cifrado no existiera.
 
-7.2 Recepcion (RX)
-    El receptor (Heltec LoRa 32 V3) ejecuta un loop infinito donde:
-    a. Escucha continuamente con radio.receive(payload).
-    b. Al detectar una senal LoRa valida en 915 MHz:
-       - Demodula el paquete y extrae el payload de texto.
-       - Lee del hardware SX1262:
-           * RSSI (Received Signal Strength Indicator): potencia en dBm
-             de la senal recibida. Valores tipicos: -30 (muy cerca)
-             a -120 (limite de sensibilidad).
-           * SNR (Signal-to-Noise Ratio): relacion senal/ruido en dB.
-             Valores > 10 dB indican senal muy limpia; < 0 dB indica
-             senal apenas por encima del ruido.
-           * Frequency Error: diferencia en Hz entre la frecuencia real
-             del transmisor y la esperada por el receptor. Util para
-             detectar derivas del oscilador.
-    c. Aplica el algoritmo de apertura del token '|':
-       - Busca el '|' en el payload recibido.
-       - Extrae el ID numerico antes del token.
-       - Extrae el texto despues del token como raw data.
-    d. Construye un JSON de telemetria con todos los valores medidos.
-    e. Lo imprime por Serial USB a 115200 baud.
-    f. Actualiza la pantalla OLED con ID, RSSI, SNR y total de paquetes.
+A continuación se describe el flujo a nivel de aplicación (texto plano).
+La capa de radio (transmitAndResume y radioReadPacket) se encarga de
+cifrar antes de enviar y descifrar después de recibir de forma
+transparente.
 
-7.3 Procesamiento en PC (Backend)
+7.1 Transmision periodica de telemetria (DATA)
+    Ambos nodos (TX y RX) ejecutan el mismo loop. El nodo configurado como
+    NODE_ROLE_TX transmite paquetes DATA cada ~1s:
+
+    1. El timer telemetryManagerPoll() detecta que ha pasado el intervalo.
+    2. Calcula el siguiente intervalo con jitter aleatorio (900-1100ms).
+    3. Incrementa el contador interno packetsTx.
+    4. Construye payload: "DATA|<packetsTx>|radioenlace exitoso".
+    5. Llama a radioSendData() que internamente hace:
+       a. buildDataPayload(id, payload) -> "DATA|1|radioenlace exitoso"
+       b. radio.transmit(payload) - Codifica y transmite via SX1262 a 915 MHz.
+       c. Si exito, inserta en tabla RTT: rttTableInsert(id, millis()).
+       d. radio.startReceive() - Vuelve a escuchar inmediatamente.
+       e. Si falla, log de error con codigo RadioLib.
+    6. El LED_BUILTIN se enciende durante la transmision (20ms no bloqueante).
+
+7.2 Recepcion de DATA y envio de ACK
+    El nodo que recibe un paquete DATA (ya sea TX o RX):
+
+    1. La interrupcion DIO1 del SX1262 dispara onLoRaReceive() -> receivedFlag.
+    2. En el loop, radioPacketAvailable() detecta la flag.
+    3. radioReadPacket(raw) lee el payload del SX1262.
+    4. El payload se evalua por prefijo: "DATA|" -> telemetryManagerOnDataReceived().
+    5. parseDataPacket() extrae el id y el texto del payload.
+    6. Lee del hardware: RSSI (radio.getRSSI()), SNR (radio.getSNR()),
+       Frequency Error (radio.getFrequencyError()).
+    7. Imprime JSON por Serial:
+         {"type":"telemetry","rssi":-65,"snr":8.5,"latency_ms":0,
+          "packet_id":42,"frequency_error":123.4,"data":"radioenlace exitoso"}
+       (latency_ms=0 porque quien recibe DATA no tiene RTT; el RTT lo calcula
+        quien recibe el ACK).
+    8. Respond automaticamente con radioSendAck(id, rssi, snr, freqErr):
+       a. buildAckPayload() -> "ACK|42|-65|8.5|123.4"
+       b. radio.transmit(ackPayload)
+       c. radio.startReceive()
+    9. Solo en RX: displayManagerUpdate() actualiza pantalla OLED.
+
+7.3 Recepcion de ACK y calculo de latencia real (RTT)
+    El nodo que envio el DATA original recibe el ACK:
+
+    1. Interrupcion DIO1 -> receivedFlag.
+    2. radioReadPacket() lee "ACK|42|-65|8.5|123.4".
+    3. Prefijo "ACK|" -> telemetryManagerOnAckReceived().
+    4. parseAckPacket() extrae id=42, rssi=-65, snr=8.5, freqErr=123.4.
+    5. rttTableTakeLatency(42, latency):
+       - Busca en tabla RTT el slot con id=42.
+       - Calcula latencia = millis()_ahora - millis()_de_envio.
+       - Marca slot como disponible.
+    6. Imprime JSON por Serial CON la latencia real:
+         {"type":"telemetry","rssi":-65,"snr":8.5,"latency_ms":12,
+          "packet_id":42,"frequency_error":123.4,"data":"radioenlace exitoso"}
+    7. El backend recibe este JSON (con latency_ms real) y lo procesa
+       como un paquete de telemetria completo.
+
+7.4 Chat bidireccional
+    Cualquier nodo puede iniciar un mensaje de chat:
+
+    1. El usuario escribe en el frontend (radio-chat) un mensaje.
+    2. El frontend envia via WebSocket: {"type":"send_chat","message":"hola"}.
+    3. El backend recibe y escribe en el Serial: SEND:hola\n
+    4. El firmware (nodo conectado) recibe "SEND:hola" en serialHandlerPoll().
+    5. Construye "CHAT|<id>|hola" y transmite por LoRa.
+    6. El otro nodo recibe el CHAT, lo imprime como JSON por Serial,
+       y responde automaticamente "CHAT_ACK|<id>".
+    7. El nodo emisor recibe el CHAT_ACK y confirma la entrega.
+    8. El backend reenvia el JSON de chat al frontend via WebSocket.
+    9. El frontend (chat.service.ts) persiste en localStorage el mensaje
+       recibido y actualiza la interfaz de chat.
+
+7.5 Heartbeat periodico
+    Cada 5 segundos, ambos nodos imprimen un JSON de heartbeat por Serial:
+      {"type":"heartbeat","status":"online","uptime":<s>,
+       "packets_tx":<N>,"packets_rx":<N>,"rssi":<int>,"snr":<float>}
+    El backend lo recibe y actualiza el estado online de los nodos.
+
+7.6 Procesamiento en PC (Backend)
     a. El backend Python (FastAPI + Uvicorn) lee el puerto COM4 a 115200 baud
        mediante PySerial, en un hilo separado (daemon).
     b. Cada linea JSON que llega del Serial se parsea.
@@ -440,10 +970,14 @@ Ubicacion: frontend/src/app/
        - Se detectan paquetes perdidos por saltos en IDs.
        - Se transmite a TODOS los clientes WebSocket conectados.
     d. Si es tipo "heartbeat":
-       - Se actualiza el estado online del receptor.
+       - Se actualiza el estado online del nodo.
        - Se transmite a los clientes WebSocket.
+    e. Si es tipo "chat":
+       - Se reenvia a todos los clientes WebSocket.
+    f. Si el frontend envia un mensaje de chat:
+       - Se escribe "SEND:texto\n" al puerto serial.
 
-7.4 Visualizacion (Frontend Angular)
+7.7 Visualizacion (Frontend Angular)
     a. El dashboard se conecta por WebSocket a ws://localhost:8000/ws.
     b. Al conectarse, recibe un mensaje "init" con el estado completo
        del sistema.
@@ -458,8 +992,10 @@ Ubicacion: frontend/src/app/
        - La tabla de historial de paquetes.
        - Los contadores del footer.
     d. Los heartbeats actualizan el estado online/offline de los nodos.
-    e. Los eventos "serial_status" notifican el estado del puerto COM4
-       (conectado, desconectado, errores).
+    e. Los eventos "serial_status" notifican el estado del puerto COM4.
+    f. Los mensajes "chat" actualizan el historial de chat en pantalla
+       y se persisten en localStorage para su recuperacion tras recarga
+       de pagina.
 
 
 8. METRICAS DERIVADAS Y FORMULAS
@@ -504,34 +1040,65 @@ Ubicacion: frontend/src/app/
     Despejando para distancia estimada usando la perdida medida
     (RSSI vs potencia de transmision de 14 dBm).
 
+8.5 Latencia real (RTT - Round Trip Time)
+    La latencia se mide en el firmware mediante una tabla circular de
+    8 slots (RTT_TABLE_SIZE). El proceso es:
+
+    1. Al transmitir un DATA, se almacena el ID y millis() actual en la tabla.
+    2. Al recibir el ACK correspondiente, se calcula:
+         latencia_ms = millis()_actual - millis()_de_envio
+    3. El resultado se incluye en el JSON de telemetria como campo
+       "latency_ms": <valor real en ms>
+    4. Esto reemplaza el anterior random(4,9) que era un valor falso.
+
+    La tabla circular permite tener hasta 8 envios pendientes de
+    confirmacion, suficiente para el intervalo de transmision de 1s.
+
 
 9. RESUMEN DEL STACK TECNOLOGICO
 --------------------------------------------------------------------------------
 
   Capa            Tecnologia
   --------------  --------------------------------------------------
-  Firmware TX     Arduino (C++), RadioLib (SX1262)
-  Firmware RX     Arduino (C++), RadioLib (SX1262), U8g2lib (OLED),
-                  nvs_flash (ESP32 NVS)
+  Firmware Nodo   Arduino (C++), RadioLib (SX1262), U8g2lib (OLED solo RX),
+                  mbedtls (AES-128 CTR hw accelerated)
   Backend         Python 3.13, FastAPI 0.115, Uvicorn 0.34, PySerial 3.5,
                   Pydantic 2.10
-  Comunicacion    LoRa 915 MHz (TX->RX, token '|'), USB Serial (RX->PC),
-                  WebSocket (backend->frontend)
+  Comunicacion    LoRa 915 MHz (DATA/ACK/CHAT cifrado con AES-128 CTR),
+                  USB Serial (nodo <-> PC, 115200 baud),
+                  WebSocket (backend <-> frontend, tiempo real)
   Frontend        Angular 21, TypeScript 5.9, Tailwind CSS 3.4,
-                  ApexCharts 5.12, RxJS 7.8
-  Protocolos      JSON (serial y WebSocket), REST API (HTTP)
+                  ApexCharts 5.12, RxJS 7.8, localStorage
+  Protocolos      JSON (serial y WebSocket), REST API (HTTP), token '|' (RF),
+                  AES-128 CTR (cifrado capa de radio)
 
 
 10. CARACTERISTICAS DESTACABLES
 --------------------------------------------------------------------------------
 
   - Sistema IoT completo: sensor RF -> microcontroladores -> PC -> web.
+  - Firmware simetrico: un solo codigo fuente para ambas placas TX y RX.
+  - Comunicacion BIDIRECCIONAL: ambos nodos transmiten, reciben y confirman.
   - Datos 100% reales desde hardware fisico (Sin simulacion en produccion).
-  - Protocolo tokenizado '|' para sincronizacion exacta de IDs TX/RX.
+  - Latencia real RTT medida con tabla circular de timestamps.
+  - ACK automatico para cada paquete DATA recibido.
+  - Chat bidireccional con confirmacion de entrega (CHAT_ACK).
+  - Protocolo tokenizado '|' para sincronizacion exacta de IDs.
   - Medicion directa de RSSI, SNR y Frequency Error desde el chip SX1262.
-  - Pantalla OLED en el receptor con telemetria en tiempo real.
+  - Pantalla OLED en el nodo RX con telemetria en tiempo real.
+  - Recepcion NO bloqueante por interrupcion DIO1 (no polling).
+  - Jitter aleatorio anti-colision en transmisiones periodicas.
+  - Validacion de errores en todas las operaciones RadioLib con log detallado.
+  - Separacion de responsabilidades en 7 modulos firmwares independientes.
+  - Cifrado AES-128 CTR en capa de radio (nonce aleatorio de 8 bytes por
+    paquete, confidencialidad total del enlace LoRa).
+  - Cifrado transparente al protocolo: solo radio_manager.cpp inyecta
+    cryptoEncrypt/cryptoDecrypt; el resto del firmware no se entera.
+  - Sin dependencias externas: usa mbedtls del core ESP32 con aceleracion
+    hardware AES.
+  - Persistencia local de chat (localStorage, hasta 200 mensajes).
   - Tiempo real: datos transmitidos via WebSocket sin polling.
-  - Reconexion automatica del WebSocket en el frontend.
+  - Reconexion automatica del WebSocket en el frontend (3s timeout).
   - Dashboard responsivo dark-themed con animaciones CSS.
   - Hero orb con anillos de pulso animados como indicador central.
   - Raw data display que muestra el contenido real del mensaje transmitido.
@@ -541,77 +1108,170 @@ Ubicacion: frontend/src/app/
   - API REST complementaria para consultas puntuales.
   - Arquitectura modular y desacoplada (backend + frontend + firmware).
   - Componentes Angular standalone (patron moderno de Angular 21).
-  - Heartbeat periodico (cada 5s) para monitorear estado del nodo receptor.
+  - Heartbeat periodico (cada 5s) para monitorear estado de los nodos.
 
 
 11. PROPOSITO DE CADA ARCHIVO DEL PROYECTO
 --------------------------------------------------------------------------------
 
   FIRMWARE:
-  firmware/transmitter/transmitter.ino
-      - Nodo TRANSMISOR. Envia paquetes LoRa con token '|' cada 1s.
-        Payload: "<ID>|radioenlace exitoso". Usa RadioLib. Sin pantalla.
-  firmware/receiver/receiver.ino
-      - Nodo RECEPTOR. Escucha paquetes LoRa, extrae ID via token '|',
-        mide RSSI/SNR/FreqError del SX1262, envia JSON por Serial,
-        actualiza OLED. Usa RadioLib + U8g2lib + nvs_flash.
+  firmware/node/node.ino
+      - Punto de entrada unico para ambos roles (TX y RX).
+        Define NODE_ROLE y llama a setup()/loop() comun.
+        Procesa el loop principal: LED, Serial, Radio, Telemetria, Display.
+
+  firmware/node/lora_node.h / lora_node.cpp
+      - Constantes de hardware y RF (pines, frecuencia, potencia).
+      - Estructuras de datos: DataPacket, AckPacket, ChatPacket.
+      - Funciones de parseo tokenizado con validacion de errores:
+        nextField(), parseDataPacket(), parseAckPacket(),
+        parseChatPacket(), parseChatAckId().
+      - Builders de payloads: buildDataPayload(), buildAckPayload(),
+        buildChatPayload(), buildChatAckPayload().
+
+  firmware/node/radio_manager.h / radio_manager.cpp
+      - Control del transceptor SX1262 via libreria RadioLib.
+      - Inicializacion (radioBegin), interrupcion DIO1 (ISR),
+        deteccion de paquetes (radioPacketAvailable),
+        lectura de payload (radioReadPacket).
+      - Transmision con reanudacion automatica (transmitAndResume):
+        cifra el payload con cryptoEncrypt() ANTES de radio.transmit().
+      - radioReadPacket(): usa radio.getPacketLength() y
+        radio.readData(uint8_t*, size_t) para leer bytes cifrados,
+        luego descifra con cryptoDecrypt() y devuelve texto plano.
+      - Funciones de envio: radioSendData, radioSendAck,
+        radioSendChat, radioSendChatAck.
+      - Lectura de metricas RF: radioGetLastRSSI, radioGetLastSNR,
+        radioGetLastFreqError.
+
+  firmware/node/serial_handler.h / serial_handler.cpp
+      - Buffer de entrada Serial (256 bytes) con procesamiento de
+        comandos "SEND:" para envio de chat.
+      - Recepcion de mensajes CHAT por RF con respuesta CHAT_ACK
+        automatica y salida JSON por Serial.
+      - Confirmacion de entrega de chat (awaitingChatAck).
+
+  firmware/node/telemetry_manager.h / telemetry_manager.cpp
+      - Gestion de heartbeat periodico (cada 5s) con JSON por Serial.
+      - Envio de DATA periodico con jitter aleatorio (900-1100ms).
+      - Recepcion de DATA con respuesta ACK automatica.
+      - Recepcion de ACK con calculo de latencia real via tabla RTT
+        circular de 8 slots.
+      - Contadores de paquetes TX/RX y metricas de ultimo paquete.
+
+  firmware/node/display_manager.h / display_manager.cpp
+      - Control de pantalla OLED SSD1306 128x64 via U8g2lib.
+      - Solo operativo cuando NODE_ROLE == NODE_ROLE_RX.
+      - Muestra: ID sincronizado, RSSI, SNR, contadores TX/RX.
+
+  firmware/node/crypto_manager.h / crypto_manager.cpp
+      - Cifrado AES-128 CTR de capa de radio usando mbedtls (ESP32 core).
+      - cryptoEncrypt(): genera nonce aleatorio de 8 bytes, cifra el
+        payload con AES-CTR, construye buffer [nonce || ciphertext].
+      - cryptoDecrypt(): extrae nonce, descifra el ciphertext, reconstruye
+        el string de texto plano.
+      - aesCtrCrypt(): funcion interna que envuelve mbedtls_aes_crypt_ctr()
+        con log de errores detallados (codigo mbedtls, funcion origen).
+      - Clave precompartida AES_KEY[16] ("LoRa-Enlace-2026") fija en código,
+        identica en ambas placas.
 
   BACKEND:
   backend/requirements.txt
       - Dependencias Python del proyecto.
+
   backend/app/main.py
       - Punto de entrada FastAPI. Lifespan, WebSocket /ws, health check /.
+      - Integracion de Serial Reader, Telemetry Service, Socket Manager.
+      - Callbacks para datos, heartbeat, chat y estado serial.
+
   backend/app/config.py
       - Constantes: SERIAL_PORT=COM4, BAUD_RATE=115200, BUFFER_SIZE=1000.
+
   backend/app/models/telemetry_model.py
       - Modelos Pydantic: TelemetryPacket, SystemStatus, HistoricalRecord.
+
   backend/app/utils/parser.py
       - Parseo de JSON serial, calculo de metricas derivadas (RSSI%,
         calidad de enlace, distancia FSPL).
+
   backend/app/serial_reader/lora_serial.py
       - Lector de puerto serial en hilo separado. Maneja modo real y
-        simulated. Reintentos de conexion. Callbacks de datos/heartbeat/status.
+        simulado. Reintentos de conexion. Envio de comandos SEND:.
+        Callbacks de datos/heartbeat/chat/status.
+
   backend/app/services/telemetry_service.py
       - Buffer circular de paquetes (deque 1000), deteccion de perdida,
         estado global del sistema.
+
   backend/app/routes/telemetry_routes.py
       - API REST: /api/telemetry/latest, /api/telemetry/history, /api/status.
+
   backend/app/websocket/socket_manager.py
       - Gestiona conexiones WebSocket, broadcast, envio de estado inicial.
 
   FRONTEND:
   frontend/package.json
       - Dependencias NPM y scripts del proyecto Angular.
+
   frontend/tailwind.config.js
       - Tema oscuro personalizado, colores de calidad de enlace, fuentes.
+
   frontend/src/index.html
       - HTML shell, tema oscuro, fuentes Inter + JetBrains Mono.
+
   frontend/src/main.ts
       - Bootstrap de la aplicacion Angular.
+
   frontend/src/styles.css
       - Clases CSS utilitarias: cards, metricas, indicadores, animaciones.
+
   frontend/src/app/app.ts
       - Componente raiz standalone (<router-outlet>).
+
   frontend/src/app/app.config.ts
       - Proveedores de zona y router.
+
   frontend/src/app/app.routes.ts
-      - Ruta "/" -> DashboardPageComponent.
+      - Rutas: "/" -> DashboardPageComponent, "/chat" -> RadioChatComponent.
+
   frontend/src/app/core/models/telemetry.interface.ts
       - Interfaces TypeScript de datos (TelemetryPacket, SystemState).
+
   frontend/src/app/services/websocket.service.ts
-      - Cliente WebSocket con reconexion automatica.
+      - Cliente WebSocket con reconexion automatica (3s timeout).
+      - Buffer de mensajes offline. Metodo send() para envio bidireccional.
+
   frontend/src/app/services/telemetry.service.ts
-      - Estado reactivo de telemetria (RxJS): distribuye mensajes por tipo.
+      - Estado reactivo de telemetria (RxJS): distribuye mensajes por tipo
+        (init, telemetry, heartbeat, serial_status).
+
+  frontend/src/app/services/chat.service.ts
+      - Servicio de chat con persistencia localStorage (200 msgs max).
+      - Interfaz ChatMessage con text, direction, timestamp, rssi, snr.
+      - loadFromStorage() al iniciar, saveToStorage() en cada mensaje.
+      - Envio de mensajes via WebSocket con tipo "send_chat".
+      - Recepcion de mensajes con metadatos RSSI/SNR del backend.
+      - linkStatus reactivo con datos del ultimo mensaje recibido.
+
+  frontend/src/app/radio-chat/radio-chat.ts
+      - Componente de chat bidireccional con interfaz de usuario.
+      - Historial de mensajes con indicacion sent/received.
+
   frontend/src/app/dashboard/pages/dashboard-page/dashboard-page.component.ts
       - Pagina principal del dashboard (template inline completo).
+
   frontend/src/app/dashboard/components/signal-card/signal-card.component.ts
       - Tarjeta metrica individual.
+
   frontend/src/app/dashboard/components/rssi-chart/rssi-chart.component.ts
       - Grafico de area RSSI en tiempo real.
+
   frontend/src/app/dashboard/components/signal-gauge/signal-gauge.component.ts
       - Medidor radial de intensidad de senal.
+
   frontend/src/app/dashboard/components/node-status/node-status.component.ts
       - Panel de estado de nodos TX/RX con animacion pulse.
+
   frontend/src/app/dashboard/components/packet-table/packet-table.component.ts
       - Tabla de historial de paquetes.
 
@@ -623,30 +1283,68 @@ Ubicacion: frontend/src/app/
     cd backend
     pip install -r requirements.txt
     python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # O usando script:
+    .\start.ps1 COM4       # Modo real con hardware
+    .\start.ps1            # Modo simulado sin hardware
 
   Frontend:
     cd frontend
     npm install
-    npm start
+    npm start              # ng serve -> http://localhost:4200
+    npm run build          # Produccion (genera dist/)
 
-  Firmware:
-    - Abrir firmware/transmitter/transmitter.ino y
-      firmware/receiver/receiver.ino en Arduino IDE.
-    - Instalar librerias:
-        * RadioLib (para SX1262)
-        * U8g2lib (para OLED SSD1306, solo receptor)
-    - Seleccionar placa: Heltec WiFi LoRa 32 V3 (ESP32-S3).
-    - Cargar transmitter.ino a la placa transmisora (sin OLED).
-    - Cargar receiver.ino a la placa receptora (con OLED).
-    - Cerrar el Serial Monitor del Arduino IDE antes de iniciar el backend.
+  Firmware (NODO unificado):
+    El firmware ha sido unificado en un solo codigo fuente. Para compilar:
+
+    1. Abrir firmware/node/node.ino en Arduino IDE (o PlatformIO).
+    2. Instalar librerias requeridas:
+         * RadioLib (control del transceptor SX1262)
+         * U8g2lib (control del OLED SSD1306, solo necesario para RX)
+    3. Para la placa TRANSMISORA (TX):
+         - En node.ino, linea 11: #define NODE_ROLE NODE_ROLE_TX
+         - NO necesita pantalla OLED (se omite automaticamente en runtime)
+         - Seleccionar placa: Heltec WiFi LoRa 32 V3 (ESP32-S3)
+         - Compilar y flashear
+    4. Para la placa RECEPTORA (RX):
+         - En node.ino, linea 11: #define NODE_ROLE NODE_ROLE_RX
+         - SI necesita pantalla OLED (se activa automaticamente)
+         - Seleccionar placa: Heltec WiFi LoRa 32 V3 (ESP32-S3)
+         - Compilar y flashear
+    5. Cerrar el Serial Monitor del Arduino IDE ANTES de iniciar el backend.
+    6. Conectar solo la placa RX al PC que ejecuta el backend.
 
   Notas importantes:
     - El backend espera el puerto COM4. Si tu sistema asigna otro puerto,
-      cambia SERIAL_PORT en backend/app/config.py.
+      cambia SERIAL_PORT en backend/app/config.py o pasalo como argumento
+      al script start.ps1.
     - Si pyserial no esta instalado, el backend entrara en modo simulado.
       Instala pyserial con: pip install pyserial
     - Cierra siempre el Serial Monitor del Arduino IDE antes de ejecutar
       el backend, o el puerto COM estara ocupado.
+    - En modo simulado, el backend genera datos aleatorios realistas sin
+      necesidad de hardware conectado.
+
+
+13. MEJORAS FUTURAS RECOMENDADAS
+--------------------------------------------------------------------------------
+
+  1. Soporte multi-puerto serial: conectar AMBOS nodos (TX y RX) al mismo
+     PC (2 puertos USB) para visualizar datos de ambos lados del enlace
+     simultaneamente en el dashboard.
+
+  2. Mostrar frequency_error_hz y distance_approx_m en el frontend: estos
+     campos ya se calculan en el backend pero no se muestran en el dashboard.
+
+  3. Agregar frecuencia de transmision configurable via Serial (cambiar
+     intervalo DATA sin recompilar el firmware).
+
+  4. Almacenamiento historico en backend (base de datos SQLite/PostgreSQL)
+     para analisis offline de tendencias del enlace.
+
+  5. CSMA/CA completo: usar radio.isChannelClear() antes de transmitir
+     para evitar colisiones cuando ambos nodos transmiten simultaneamente.
+
+  6. Modo LoRaWAN como alternativa al protocolo raw actual.
 
 
 ================================================================================
